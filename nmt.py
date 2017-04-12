@@ -242,6 +242,8 @@ class NMT(nn.Module):
         if not type(src_sent[0]) == list:
             src_sent = [src_sent]
 
+        batch_size = len(src_sent) * sample_size
+
         src_words, src_word_masks = input_transpose(src_sent, self.src_vocab['<pad>'])
         src_words = Variable(torch.LongTensor(src_words), volatile=True)
         if args.cuda:
@@ -250,8 +252,13 @@ class NMT(nn.Module):
         src_encoding, init_ctx_vec = self.encode(src_words)
 
         # tile everything
-        src_encoding = src_encoding.expand(src_encoding.size(0), sample_size, src_encoding.size(2)).contiguous()
-        init_ctx_vec = init_ctx_vec.expand(sample_size, init_ctx_vec.size(1))
+        # src_enc: (src_sent_len, sample_size, enc_size)
+        # cat result: (src_sent_len, batch_size * sample_size, enc_size)
+        src_encoding = torch.cat([src_enc.expand(src_enc.size(0), sample_size, src_enc.size(2)) for src_enc in src_encoding.split(1, dim=1)], 1)
+        init_ctx_vec = torch.cat([init_ctx.expand(sample_size, init_ctx.size(1)) for init_ctx in init_ctx_vec.split(1, dim=0)], 0)
+
+        # src_encoding = src_encoding.expand(src_encoding.size(0), sample_size, src_encoding.size(2)).contiguous()
+        # init_ctx_vec = init_ctx_vec.expand(sample_size, init_ctx_vec.size(1))
 
         init_cell = init_ctx_vec
         init_state = F.tanh(init_cell)
@@ -263,14 +270,14 @@ class NMT(nn.Module):
         hidden = (init_state, init_cell)
 
         if not self.args.cuda:
-            ctx_tm1 = Variable(torch.zeros(sample_size, self.args.hidden_size * 2), volatile=True)
+            ctx_tm1 = Variable(torch.zeros(batch_size, self.args.hidden_size * 2), volatile=True)
         else:
-            ctx_tm1 = Variable(torch.zeros(sample_size, self.args.hidden_size * 2), volatile=True).cuda()
+            ctx_tm1 = Variable(torch.zeros(batch_size, self.args.hidden_size * 2), volatile=True).cuda()
 
-        y_0 = Variable(torch.LongTensor([self.tgt_vocab['<s>'] for i in xrange(sample_size)]), volatile=True)
+        y_0 = Variable(torch.LongTensor([self.tgt_vocab['<s>'] for _ in xrange(batch_size)]), volatile=True)
 
         eos = self.tgt_vocab['</s>']
-        eos_batch = torch.LongTensor([eos] * sample_size)
+        eos_batch = torch.LongTensor([eos] * batch_size)
         if args.cuda:
             y_0 = y_0.cuda()
             eos_batch = eos_batch.cuda()
@@ -307,7 +314,7 @@ class NMT(nn.Module):
             hidden = h_t, cell_t
 
         # post-processing
-        completed_samples = [list() for i in xrange(sample_size)]
+        completed_samples = [list() for _ in xrange(batch_size)]
         for y_t in samples:
             for i, sampled_word in enumerate(y_t.cpu().data):
                 if len(completed_samples[i]) == 0 or completed_samples[i][-1] != eos:
@@ -452,7 +459,7 @@ def sample(args):
     train_data = zip(train_data_src, train_data_tgt)
     print('begin sampling')
 
-    for src_sents, tgt_sents in data_iter(train_data, batch_size=1):
+    for src_sents, tgt_sents in data_iter(train_data, batch_size=args.batch_size):
         src_word_ids = word2id(src_sents, src_vocab)
         samples = model.sample(src_word_ids, sample_size=args.sample_size, to_word=True)
         print('*' * 80)
