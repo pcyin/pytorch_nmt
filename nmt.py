@@ -3,6 +3,8 @@ from __future__ import print_function
 import time
 import torch
 import torch.nn as nn
+import torch.nn.utils
+from nltk.translate.bleu_score import corpus_bleu
 from torch.autograd import Variable
 from torch import optim
 from torch.nn import Parameter
@@ -10,13 +12,13 @@ import torch.nn.functional as F
 
 import numpy as np
 from collections import defaultdict, Counter, namedtuple
-from itertools import chain
+from itertools import chain, islice
 import argparse, os, sys
 
 
 def init_config():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--seed', default=914808182, type=int)
+    parser.add_argument('--seed', default=5783287, type=int)
     parser.add_argument('--cuda', action='store_true', default=False)
     parser.add_argument('--mode', choices=['train', 'test', 'sample'], default='train')
     parser.add_argument('--batch_size', default=32, type=int)
@@ -45,12 +47,17 @@ def init_config():
     parser.add_argument('--save_model_after', default=2)
     parser.add_argument('--save_to_file', default=None, type=str)
     parser.add_argument('--patience', default=5, type=int)
-    parser.add_argument('--optimizer', choices=['adam', 'sgd'], default='adam', type=str)
-    parser.add_argument('--lr', default=0.001, type=float)
+    parser.add_argument('--clip_grad', default=5., type=float)
     parser.add_argument('--max_niter', default=-1, type=int)
 
+    parser.add_argument('--sample_method', default='expand')
+
     args = parser.parse_args()
-    # seed numpy
+
+    # seed the RNG
+    torch.manual_seed(args.seed)
+    if args.cuda:
+        torch.cuda.manual_seed(args.seed)
     np.random.seed(args.seed * 13 / 7)
 
     return args
@@ -166,9 +173,13 @@ class NMT(nn.Module):
         # transform encoding states to the first state in decoder
         self.dec_init_linear = nn.Linear(args.hidden_size * 2, args.hidden_size)
 
+        # attention
         self.att_src_linear = nn.Linear(args.hidden_size * 2, args.attention_size, bias=False)
         self.att_h_linear = nn.Linear(args.hidden_size, args.attention_size, bias=False)
         self.att_linear = nn.Linear(args.attention_size, 1)
+
+        # readout dropout
+        self.dropout = nn.Dropout(args.dropout)
 
     def forward(self, src_words, tgt_words):
         src_encodings, init_ctx_vec = self.encode(src_words)
@@ -211,10 +222,7 @@ class NMT(nn.Module):
 
         hidden = (init_state, init_cell)
 
-        if not self.args.cuda:
-            ctx_tm1 = Variable(torch.zeros(batch_size, self.args.hidden_size * 2), requires_grad=False)
-        else:
-            ctx_tm1 = Variable(torch.zeros(batch_size, self.args.hidden_size * 2), requires_grad=False).cuda()
+        ctx_tm1 = Variable(init_cell.data.new(batch_size, self.args.hidden_size * 2).zero_(), requires_grad=False)
 
         tgt_word_embed = self.tgt_embed(tgt_words)
         scores = []
@@ -229,6 +237,8 @@ class NMT(nn.Module):
             ctx_t, alpha_t = self.attention(h_t, src_encoding, src_linear_for_att)
 
             read_out = F.tanh(self.dec_state_linear(torch.cat([h_t, ctx_t], 1)))
+            read_out = self.dropout(read_out)
+
             score_t = self.readout(read_out)
             scores.append(score_t)
 
@@ -238,9 +248,112 @@ class NMT(nn.Module):
         scores = torch.stack(scores)
         return scores
 
-    def sample(self, src_sent, sample_size=5, to_word=False):
+    def translate(self, src_sent, beam_size=None, to_word=True):
         if not type(src_sent[0]) == list:
             src_sent = [src_sent]
+        if not beam_size:
+            beam_size = args.beam_size
+
+        src_words, src_word_masks = input_transpose(src_sent, self.src_vocab['<pad>'])
+        src_words = Variable(torch.LongTensor(src_words), volatile=True)
+        if args.cuda:
+            src_words = src_words.cuda()
+
+        src_encoding, init_ctx_vec = self.encode(src_words)
+
+        init_cell = init_ctx_vec
+        init_state = F.tanh(init_cell)
+
+        # pre-compute transformations for source sentences in calculating attention score
+        # (src_sent_len, 1, attention_size)
+        src_linear_for_att = tensor_transform(self.att_src_linear, src_encoding)
+
+        ctx_tm1 = Variable(torch.zeros(beam_size, self.args.hidden_size * 2), volatile=True)
+        hyp_scores = Variable(torch.zeros(beam_size), volatile=True)
+        if args.cuda:
+            ctx_tm1 = ctx_tm1.cuda()
+            hyp_scores = hyp_scores.cuda()
+        hidden = (init_state.expand(beam_size, init_state.size(1)), init_cell.expand(beam_size, init_cell.size(1)))
+
+        eos_id = self.tgt_vocab['</s>']
+        hypotheses = [[self.tgt_vocab['<s>']] for _ in xrange(beam_size)]
+        completed_hypotheses = []
+        completed_hypothesis_scores = []
+
+        t = 0
+        while len(completed_hypotheses) < beam_size and t < args.decode_max_time_step:
+            t += 1
+            hyp_num = len(hypotheses)
+
+            expanded_src_encoding = src_encoding.expand(src_encoding.size(0), hyp_num, src_encoding.size(2))
+            expanded_src_linear_for_att = src_linear_for_att.expand(src_linear_for_att.size(0), hyp_num, src_linear_for_att.size(2))
+
+            y_tm1 = Variable(torch.LongTensor([hyp[-1] for hyp in hypotheses]), volatile=True)
+            if args.cuda:
+                y_tm1 = y_tm1.cuda()
+
+            y_tm1_embed = self.tgt_embed(y_tm1)
+
+            x = torch.cat([y_tm1_embed, ctx_tm1], 1)
+
+            # h_t: (hyp_num, hidden_size)
+            h_t, cell_t = self.decoder_lstm(x, hidden)
+
+            ctx_t, alpha_t = self.attention(h_t, expanded_src_encoding, expanded_src_linear_for_att)
+
+            read_out = F.tanh(self.dec_state_linear(torch.cat([h_t, ctx_t], 1)))
+            read_out = self.dropout(read_out)
+
+            score_t = self.readout(read_out)
+            p_t = F.log_softmax(score_t)
+
+            new_hyp_scores = (hyp_scores.unsqueeze(1).expand_as(p_t) + p_t).view(-1)
+            top_new_hyp_scores, top_new_hyp_pos = torch.topk(new_hyp_scores, k=hyp_num)
+            prev_hyp_ids = top_new_hyp_pos / args.tgt_vocab_size
+            word_ids = top_new_hyp_pos % args.tgt_vocab_size
+            new_hyp_scores = new_hyp_scores[top_new_hyp_pos.data]
+
+            new_hypotheses = []
+
+            live_hyp_ids = []
+            for prev_hyp_id, word_id, new_hyp_score in zip(prev_hyp_ids.cpu().data, word_ids.cpu().data, new_hyp_scores.cpu().data):
+                hyp_tgt_words = hypotheses[prev_hyp_id] + [word_id]
+                if word_id == eos_id:
+                    completed_hypotheses.append(hyp_tgt_words)
+                    completed_hypothesis_scores.append(new_hyp_score)
+                else:
+                    new_hypotheses.append(hyp_tgt_words)
+                    live_hyp_ids.append(prev_hyp_id)
+
+            if len(completed_hypotheses) == beam_size:
+                break
+
+            live_hyp_ids = torch.LongTensor(live_hyp_ids)
+            if args.cuda:
+                live_hyp_ids = live_hyp_ids.cuda()
+
+            hidden = (h_t[live_hyp_ids], cell_t[live_hyp_ids])
+            ctx_tm1 = ctx_t[live_hyp_ids]
+            hyp_scores = new_hyp_scores[live_hyp_ids]
+            hypotheses = new_hypotheses
+
+        if len(completed_hypotheses) == 0:
+            completed_hypotheses = [hypotheses[0]]
+            completed_hypothesis_scores = [0.0]
+
+        if to_word:
+            for i, hyp in enumerate(completed_hypotheses):
+                completed_hypotheses[i] = [self.tgt_vocab_id2word[w] for w in hyp]
+
+        ranked_hypotheses = sorted(zip(completed_hypotheses, completed_hypothesis_scores), key=lambda x: x[1], reverse=True)
+
+        return [hyp for hyp, score in ranked_hypotheses]
+
+    def sample(self, src_sent, sample_size=None, to_word=False):
+        if not type(src_sent[0]) == list:
+            src_sent = [src_sent]
+        if not sample_size:
+            sample_size = args.sample_size
 
         batch_size = len(src_sent) * sample_size
 
@@ -252,10 +365,14 @@ class NMT(nn.Module):
         src_encoding, init_ctx_vec = self.encode(src_words)
 
         # tile everything
-        # src_enc: (src_sent_len, sample_size, enc_size)
-        # cat result: (src_sent_len, batch_size * sample_size, enc_size)
-        src_encoding = torch.cat([src_enc.expand(src_enc.size(0), sample_size, src_enc.size(2)) for src_enc in src_encoding.split(1, dim=1)], 1)
-        init_ctx_vec = torch.cat([init_ctx.expand(sample_size, init_ctx.size(1)) for init_ctx in init_ctx_vec.split(1, dim=0)], 0)
+        if args.sample_method == 'expand':
+            # src_enc: (src_sent_len, sample_size, enc_size)
+            # cat result: (src_sent_len, batch_size * sample_size, enc_size)
+            src_encoding = torch.cat([src_enc.expand(src_enc.size(0), sample_size, src_enc.size(2)) for src_enc in src_encoding.split(1, dim=1)], 1)
+            init_ctx_vec = torch.cat([init_ctx.expand(sample_size, init_ctx.size(1)) for init_ctx in init_ctx_vec.split(1, dim=0)], 0)
+        elif args.sample_method == 'repeat':
+            src_encoding = src_encoding.repeat(1, sample_size, 1)
+            init_ctx_vec = init_ctx_vec.repeat(sample_size, 1)
 
         # src_encoding = src_encoding.expand(src_encoding.size(0), sample_size, src_encoding.size(2)).contiguous()
         # init_ctx_vec = init_ctx_vec.expand(sample_size, init_ctx_vec.size(1))
@@ -301,6 +418,8 @@ class NMT(nn.Module):
             ctx_t, alpha_t = self.attention(h_t, src_encoding, src_linear_for_att)
 
             read_out = F.tanh(self.dec_state_linear(torch.cat([h_t, ctx_t], 1)))
+            read_out = self.dropout(read_out)
+
             score_t = self.readout(read_out)
             p_t = F.softmax(score_t)
 
@@ -357,6 +476,7 @@ def train(args):
     tgt_vocab_id2word = build_id2word_vocab(tgt_vocab)
 
     model = NMT(args, src_vocab, tgt_vocab, src_vocab_id2word, tgt_vocab_id2word)
+    model.train()
 
     vocab_mask = torch.ones(args.tgt_vocab_size)
     vocab_mask[tgt_vocab['<pad>']] = 0
@@ -396,9 +516,34 @@ def train(args):
                 train_time = time.time()
                 cum_loss = cum_examples = 0.
 
-                model_file = args.save_to + '.iter%d.bin' % train_iter
-                print('save model to %s' % model_file, file=sys.stderr)
-                model.save(model_file)
+                print('begin validation ...', file=sys.stderr)
+                model.eval()
+                dev_hyps, dev_bleu = decode(model, dev_data)
+                model.train()
+                print('validation: iter %d, dev. bleu %f' % (train_iter, dev_bleu), file=sys.stderr)
+
+                is_better = len(hist_valid_scores) == 0 or dev_bleu > max(hist_valid_scores)
+                hist_valid_scores.append(dev_bleu)
+
+                if valid_num > args.save_model_after:
+                    model_file = args.save_to + '.iter%d.bin' % train_iter
+                    print('save model to [%s]' % model_file, file=sys.stderr)
+                    model.save(model_file)
+
+                if is_better:
+                    patience = 0
+                    best_model_iter = train_iter
+
+                    if valid_num > args.save_model_after:
+                        print('save currently the best model ..', file=sys.stderr)
+                        os.system('ln -sf %s %s' % (model_file, args.save_to + '.bin'))
+                else:
+                    patience += 1
+                    print('hit patience %d' % patience, file=sys.stderr)
+                    if patience == args.patience:
+                        print('early stop!', file=sys.stderr)
+                        print('the best model is from iteration [%d]' % best_model_iter, file=sys.stderr)
+                        exit(0)
 
             optimizer.zero_grad()
 
@@ -433,10 +578,75 @@ def train(args):
             print('epoch %d, iter %d, loss=%f, ppl=%f' % (epoch, train_iter, loss_val, ppl))
 
             loss.backward()
+            # clip gradient
+            grad_norm = torch.nn.utils.clip_grad_norm(model.parameters(), args.clip_grad)
             optimizer.step()
 
             cum_loss += loss_val * batch_size
             cum_examples += batch_size
+
+
+def get_bleu(references, hypotheses):
+    # compute BLEU
+    bleu_score = corpus_bleu([[ref[1:-1]] for ref in references],
+                             [hyp[1:-1] for hyp in hypotheses])
+
+    return bleu_score
+
+
+def decode(model, data):
+    hypotheses = []
+    begin_time = time.time()
+    for src_sent, tgt_sent in data:
+        src_sent_wids = word2id(src_sent, model.src_vocab)
+        hyp = model.translate(src_sent_wids)[0]
+        hypotheses.append(hyp)
+        print('*' * 50)
+        print('Source: ', ' '.join(src_sent))
+        print('Target: ', ' '.join(tgt_sent))
+        print('Hypothesis: ', ' '.join(hyp))
+
+    elapsed = time.time() - begin_time
+    bleu_score = get_bleu([tgt for src, tgt in data], hypotheses)
+
+    print('decoded %d examples, took %d s' % (len(data), elapsed), file=sys.stderr)
+    if args.save_to_file:
+        print('save decoding results to %s' % args.save_to_file, file=sys.stderr)
+        with open(args.save_to_file, 'w') as f:
+            for hyp in hypotheses:
+                f.write(' '.join(hyp[1:-1]) + '\n')
+
+    return hypotheses, bleu_score
+
+
+def test(args):
+    train_data_src = read_corpus(args.train_src)
+    train_data_tgt = read_corpus(args.train_tgt)
+
+    src_vocab = build_vocab(train_data_src, args.src_vocab_size)
+    tgt_vocab = build_vocab(train_data_tgt, args.tgt_vocab_size)
+
+    src_vocab_id2word = build_id2word_vocab(src_vocab)
+    tgt_vocab_id2word = build_id2word_vocab(tgt_vocab)
+
+    test_data_src = read_corpus(args.test_src)
+    test_data_tgt = read_corpus(args.test_tgt)
+
+    model = NMT(args, src_vocab, tgt_vocab, src_vocab_id2word, tgt_vocab_id2word)
+    model.eval()
+
+    if args.load_model:
+        print('load model from [%s]' % args.load_model, file=sys.stderr)
+        model.load_state_dict(torch.load(args.load_model, map_location=lambda storage, loc: storage))
+    if args.cuda:
+        model = model.cuda()
+
+    test_data = zip(test_data_src, test_data_tgt)
+
+    hypotheses, bleu_score = decode(model, test_data)
+
+    bleu_score = get_bleu([tgt for src, tgt in test_data], hypotheses)
+    print('Corpus Level BLEU: %f' % bleu_score, file=sys.stderr)
 
 
 def sample(args):
@@ -450,6 +660,8 @@ def sample(args):
     tgt_vocab_id2word = build_id2word_vocab(tgt_vocab)
 
     model = NMT(args, src_vocab, tgt_vocab, src_vocab_id2word, tgt_vocab_id2word)
+    model.eval()
+
     if args.load_model:
         print('load model from [%s]' % args.load_model, file=sys.stderr)
         model.load_state_dict(torch.load(args.load_model, map_location=lambda storage, loc: storage))
@@ -459,15 +671,28 @@ def sample(args):
     train_data = zip(train_data_src, train_data_tgt)
     print('begin sampling')
 
-    for src_sents, tgt_sents in data_iter(train_data, batch_size=args.batch_size):
+    check_every = 10
+    train_iter = cum_samples = 0
+    train_time = time.time()
+    for src_sents, tgt_sents in islice(data_iter(train_data, batch_size=args.batch_size), 500):
+        train_iter += 1
         src_word_ids = word2id(src_sents, src_vocab)
         samples = model.sample(src_word_ids, sample_size=args.sample_size, to_word=True)
-        print('*' * 80)
-        print('target:' + ' '.join(tgt_sents[0]))
-        print('samples:')
-        for i, sample in enumerate(samples, 1):
-            print('[%d] %s' % (i, ' '.join(sample[1:-1])))
-        print('*' * 80)
+        cum_samples += len(samples)
+        print('%d samples' % len(samples))
+
+        if train_iter % check_every == 0:
+            elapsed = time.time() - train_time
+            print('sampling speed: %d/s' % (cum_samples / elapsed))
+            cum_samples = 0
+            train_time = time.time()
+
+        # print('*' * 80)
+        # print('target:' + ' '.join(tgt_sents[0]))
+        # print('samples:')
+        # for i, sample in enumerate(samples, 1):
+        #     print('[%d] %s' % (i, ' '.join(sample[1:-1])))
+        # print('*' * 80)
 
 if __name__ == '__main__':
     args = init_config()
@@ -477,3 +702,5 @@ if __name__ == '__main__':
         train(args)
     elif args.mode == 'sample':
         sample(args)
+    elif args.mode == 'test':
+        test(args)
