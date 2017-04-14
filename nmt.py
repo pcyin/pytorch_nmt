@@ -49,6 +49,7 @@ def init_config():
     parser.add_argument('--patience', default=5, type=int)
     parser.add_argument('--clip_grad', default=5., type=float)
     parser.add_argument('--max_niter', default=-1, type=int)
+    parser.add_argument('--lr_decay', default=None, type=float)
 
     parser.add_argument('--sample_method', default='expand')
 
@@ -529,12 +530,18 @@ def train(args):
                 print('validation: iter %d, dev. bleu %f' % (train_iter, dev_bleu), file=sys.stderr)
 
                 is_better = len(hist_valid_scores) == 0 or dev_bleu > max(hist_valid_scores)
+                is_better_than_last = len(hist_valid_scores) == 0 or dev_bleu > hist_valid_scores[-1]
                 hist_valid_scores.append(dev_bleu)
 
                 if valid_num > args.save_model_after:
                     model_file = args.save_to + '.iter%d.bin' % train_iter
                     print('save model to [%s]' % model_file, file=sys.stderr)
                     model.save(model_file)
+
+                if (not is_better_than_last) and args.lr_decay:
+                    lr = optimizer.param_groups[0]['lr'] * args.lr_decay
+                    print('decay learning rate to %f' % lr, file=sys.stderr)
+                    optimizer.param_groups[0]['lr'] = lr
 
                 if is_better:
                     patience = 0
