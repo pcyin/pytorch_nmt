@@ -162,8 +162,8 @@ class NMT(nn.Module):
         self.src_embed = nn.Embedding(args.src_vocab_size, args.embed_size)
         self.tgt_embed = nn.Embedding(args.tgt_vocab_size, args.embed_size)
 
-        self.encoder_lstm = nn.LSTM(args.embed_size, args.hidden_size, bidirectional=True)
-        self.decoder_lstm = nn.LSTMCell(args.embed_size + args.hidden_size * 2, args.hidden_size)
+        self.encoder_lstm = nn.LSTM(args.embed_size, args.hidden_size, bidirectional=True, dropout=args.dropout)
+        self.decoder_lstm = nn.LSTMCell(args.embed_size + args.hidden_size * 2, args.hidden_size, dropout=args.dropout)
 
         # prediction layer of the target vocabulary
         self.readout = nn.Linear(args.embed_size, args.tgt_vocab_size)
