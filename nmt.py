@@ -162,7 +162,7 @@ class NMT(nn.Module):
         self.tgt_embed = nn.Embedding(args.tgt_vocab_size, args.embed_size)
 
         self.encoder_lstm = nn.LSTM(args.embed_size, args.hidden_size, bidirectional=True)
-        self.decoder_lstm = nn.LSTMCell(args.embed_size + args.hidden_size * 2, args.hidden_size)
+        self.decoder_lstm = nn.LSTMCell(args.embed_size + args.embed_size, args.hidden_size)
 
         # prediction layer of the target vocabulary
         self.readout = nn.Linear(args.embed_size, args.tgt_vocab_size)
@@ -228,7 +228,7 @@ class NMT(nn.Module):
 
         hidden = (init_state, init_cell)
 
-        ctx_tm1 = Variable(init_cell.data.new(batch_size, self.args.hidden_size * 2).zero_(), requires_grad=False)
+        ctx_tm1 = Variable(init_cell.data.new(batch_size, self.args.embed_size).zero_(), requires_grad=False)
 
         tgt_word_embed = self.tgt_embed(tgt_words)
         scores = []
@@ -248,7 +248,7 @@ class NMT(nn.Module):
             score_t = self.readout(read_out)
             scores.append(score_t)
 
-            ctx_tm1 = ctx_t
+            ctx_tm1 = read_out
             hidden = h_t, cell_t
 
         scores = torch.stack(scores)
@@ -274,7 +274,7 @@ class NMT(nn.Module):
         # (src_sent_len, 1, attention_size)
         src_linear_for_att = tensor_transform(self.att_src_linear, src_encoding)
 
-        ctx_tm1 = Variable(torch.zeros(beam_size, self.args.hidden_size * 2), volatile=True)
+        ctx_tm1 = Variable(torch.zeros(beam_size, self.args.embed_size), volatile=True)
         hyp_scores = Variable(torch.zeros(beam_size), volatile=True)
         if args.cuda:
             ctx_tm1 = ctx_tm1.cuda()
@@ -339,7 +339,7 @@ class NMT(nn.Module):
                 live_hyp_ids = live_hyp_ids.cuda()
 
             hidden = (h_t[live_hyp_ids], cell_t[live_hyp_ids])
-            ctx_tm1 = ctx_t[live_hyp_ids]
+            ctx_tm1 = read_out[live_hyp_ids]
             hyp_scores = new_hyp_scores[live_hyp_ids]
             hypotheses = new_hypotheses
 
