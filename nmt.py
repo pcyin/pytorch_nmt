@@ -181,6 +181,12 @@ class NMT(nn.Module):
         # readout dropout
         self.dropout = nn.Dropout(args.dropout)
 
+        # zero all biases
+        self.readout.bias.data.zero_()
+        self.dec_state_linear.bias.data.zero_()
+        self.dec_init_linear.bias.data.zero_()
+        self.att_linear.bias.data.zero_()
+
     def forward(self, src_words, tgt_words):
         src_encodings, init_ctx_vec = self.encode(src_words)
         scores = self.decode(src_encodings, init_ctx_vec, tgt_words)
@@ -536,7 +542,9 @@ def train(args):
 
                     if valid_num > args.save_model_after:
                         print('save currently the best model ..', file=sys.stderr)
-                        os.system('ln -sf %s %s' % (model_file, args.save_to + '.bin'))
+                        model_file_abs_path = os.path.abspath(model_file)
+                        symlin_file_abs_path = os.path.abspath(args.save_to + '.bin')
+                        os.system('ln -sf %s %s' % (model_file_abs_path, symlin_file_abs_path))
                 else:
                     patience += 1
                     print('hit patience %d' % patience, file=sys.stderr)
