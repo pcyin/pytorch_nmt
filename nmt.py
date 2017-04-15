@@ -310,7 +310,7 @@ class NMT(nn.Module):
             h_t, cell_t = self.decoder_lstm(x, hidden)
             h_t = self.dropout(h_t)
 
-            ctx_t, alpha_t = self.attention(h_t, expanded_src_encoding, expanded_src_linear_for_att)
+            ctx_t, alpha_t = self.dot_prod_attention(h_t, expanded_src_encoding, expanded_src_linear_for_att)
 
             read_out = F.tanh(self.dec_state_linear(torch.cat([h_t, ctx_t], 1)))
             read_out = self.dropout(read_out)
@@ -398,9 +398,9 @@ class NMT(nn.Module):
         hidden = (init_state, init_cell)
 
         if not self.args.cuda:
-            ctx_tm1 = Variable(torch.zeros(batch_size, self.args.hidden_size * 2), volatile=True)
+            ctx_tm1 = Variable(torch.zeros(batch_size, self.args.hidden_size), volatile=True)
         else:
-            ctx_tm1 = Variable(torch.zeros(batch_size, self.args.hidden_size * 2), volatile=True).cuda()
+            ctx_tm1 = Variable(torch.zeros(batch_size, self.args.hidden_size), volatile=True).cuda()
 
         y_0 = Variable(torch.LongTensor([self.tgt_vocab['<s>'] for _ in xrange(batch_size)]), volatile=True)
 
@@ -427,7 +427,7 @@ class NMT(nn.Module):
             h_t, cell_t = self.decoder_lstm(x, hidden)
             h_t = self.dropout(h_t)
 
-            ctx_t, alpha_t = self.attention(h_t, src_encoding, src_linear_for_att)
+            ctx_t, alpha_t = self.dot_prod_attention(h_t, src_encoding, src_linear_for_att)
 
             read_out = F.tanh(self.dec_state_linear(torch.cat([h_t, ctx_t], 1)))
             read_out = self.dropout(read_out)
