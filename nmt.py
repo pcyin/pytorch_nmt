@@ -105,7 +105,7 @@ def batch_slice(data, batch_size):
               [data[i * batch_size + b][1] for b in range(cur_batch_size)]
 
 
-def data_iter(data, batch_size):
+def data_iter(data, batch_size, shuffle=True):
     buckets = defaultdict(list)
     for pair in data:
         src_sent = pair[0]
@@ -117,7 +117,9 @@ def data_iter(data, batch_size):
         np.random.shuffle(tuples)
         batched_data.extend(list(batch_slice(tuples, batch_size)))
 
-    np.random.shuffle(batched_data)
+    if shuffle:
+        np.random.shuffle(batched_data)
+
     for batch in batched_data:
         yield batch
 
@@ -472,6 +474,37 @@ class NMT(nn.Module):
         torch.save(self.state_dict(), path)
 
 
+def evaluate_loss(model, data, crit):
+    model.eval()
+    cum_loss = 0.
+    cum_tgt_words = 0.
+    for src_sents, tgt_sents in data_iter(data, batch_size=args.batch_size, shuffle=False):
+        src_word_ids = word2id(src_sents, model.src_vocab)
+        tgt_word_ids = word2id(tgt_sents, model.tgt_vocab)
+
+        pred_tgt_word_num = sum(len(s[1:]) for s in tgt_sents) # omitting leading `<s>`
+
+        src_words, src_masks = input_transpose(src_word_ids, model.src_vocab['<pad>'])
+        tgt_words, tgt_masks = input_transpose(tgt_word_ids, model.tgt_vocab['<pad>'])
+
+        src_words_var = Variable(torch.LongTensor(src_words), volatile=True)
+        tgt_words_var = Variable(torch.LongTensor(tgt_words), volatile=True)
+
+        if args.cuda:
+            src_words_var = src_words_var.cuda()
+            tgt_words_var = tgt_words_var.cuda()
+
+        # (tgt_sent_len, batch_size, tgt_vocab_size)
+        scores = model(src_words_var, tgt_words_var[:-1])
+        loss = crit(scores.view(-1, scores.size(2)), tgt_words_var[1:].view(-1))
+
+        cum_loss += loss
+        cum_tgt_words += pred_tgt_word_num
+
+    loss = cum_loss / cum_tgt_words
+    return loss
+
+
 def train(args):
     train_data_src = read_corpus(args.train_src)
     train_data_tgt = read_corpus(args.train_tgt)
@@ -500,7 +533,7 @@ def train(args):
 
     train_data = zip(train_data_src, train_data_tgt)
     dev_data = zip(dev_data_src, dev_data_tgt)
-    train_iter = patience = cum_loss = cum_examples = epoch = valid_num = best_model_iter = 0
+    train_iter = patience = cum_loss = cum_tgt_words = cum_examples = epoch = valid_num = best_model_iter = 0
     hist_valid_scores = []
     train_time = time.time()
     print('begin Maximum Likelihood training')
@@ -513,24 +546,30 @@ def train(args):
             tgt_word_ids = word2id(tgt_sents, tgt_vocab)
 
             batch_size = len(src_sents)
-            total_word_num = sum(len(s) for s in tgt_sents)
+            pred_tgt_word_num = sum(len(s[1:]) for s in tgt_sents) # omitting leading `<s>`
 
             if train_iter % args.valid_niter == 0:
                 valid_num += 1
-                print('epoch %d, iter %d, cum. loss %f, ' \
+                print('epoch %d, iter %d, avg. loss %f, avg. ppl %f ' \
                       'cum. examples %d, time elapsed %f(s)' % (epoch, train_iter,
                                                                 cum_loss / cum_examples,
+                                                                np.exp(cum_loss / cum_tgt_words),
                                                                 cum_examples,
                                                                 time.time() - train_time), file=sys.stderr)
 
                 train_time = time.time()
-                cum_loss = cum_examples = 0.
+                cum_loss = cum_tgt_words = cum_examples = 0.
 
                 print('begin validation ...', file=sys.stderr)
                 model.eval()
+
+                # compute dev. ppl and bleu
+                dev_loss = evaluate_loss(model, dev_data, cross_entropy_loss)
+                dev_ppl = np.exp(dev_loss)
                 dev_hyps, dev_bleu = decode(model, dev_data)
+
                 model.train()
-                print('validation: iter %d, dev. bleu %f' % (train_iter, dev_bleu), file=sys.stderr)
+                print('validation: iter %d, dev. ppl %f, dev. bleu %f' % (train_iter, dev_ppl, dev_bleu), file=sys.stderr)
 
                 is_better = len(hist_valid_scores) == 0 or dev_bleu > max(hist_valid_scores)
                 is_better_than_last = len(hist_valid_scores) == 0 or dev_bleu > hist_valid_scores[-1]
@@ -589,9 +628,11 @@ def train(args):
 
             # loss = torch.stack(losses).sum()
 
-            ppl = np.exp(loss.data[0] / total_word_num)
+            ppl = np.exp(loss.data[0] / pred_tgt_word_num)
             loss /= batch_size
             loss_val = loss.data[0]
+
+            assert pred_tgt_word_num == tgt_words_var[1:].ne(tgt_vocab['<pad>']).sum()
 
             print('epoch %d, iter %d, loss=%f, ppl=%f' % (epoch, train_iter, loss_val, ppl))
 
@@ -601,6 +642,7 @@ def train(args):
             optimizer.step()
 
             cum_loss += loss_val * batch_size
+            cum_tgt_words += pred_tgt_word_num
             cum_examples += batch_size
 
 
