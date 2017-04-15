@@ -502,7 +502,7 @@ def train(args):
 
     optimizer = torch.optim.Adam(model.parameters())
 
-    train_iter = patience = cum_loss = cum_tgt_words = cum_examples = epoch = valid_num = best_model_iter = 0
+    train_iter = patience = log_cum_loss = log_tgt_words = cum_examples = log_cum_examples = epoch = valid_num = best_model_iter = 0
     hist_valid_scores = []
     train_time = begin_time = time.time()
     print('begin Maximum Likelihood training')
@@ -534,21 +534,22 @@ def train(args):
             grad_norm = torch.nn.utils.clip_grad_norm(model.parameters(), args.clip_grad)
             optimizer.step()
 
-            cum_loss += word_loss_val
-            cum_tgt_words += pred_tgt_word_num
+            log_cum_loss += word_loss_val
+            log_tgt_words += pred_tgt_word_num
+            log_cum_examples += batch_size
             cum_examples += batch_size
 
             if train_iter % args.log_every == 0:
                 print('epoch %d, iter %d, avg. loss %.2f, avg. ppl %.2f ' \
                       'cum. examples %d, speed %.2f words/sec, time elapsed %.2f sec' % (epoch, train_iter,
-                                                                                         cum_loss / cum_examples,
-                                                                                         np.exp(cum_loss / cum_tgt_words),
+                                                                                         log_cum_loss / log_cum_examples,
+                                                                                         np.exp(log_cum_loss / log_tgt_words),
                                                                                          cum_examples,
-                                                                                         cum_tgt_words / (time.time() - train_time),
+                                                                                         log_tgt_words / (time.time() - train_time),
                                                                                          time.time() - begin_time), file=sys.stderr)
 
                 train_time = time.time()
-                cum_loss = cum_tgt_words = cum_examples = 0.
+                log_cum_loss = log_tgt_words = log_cum_examples = 0.
 
             # perform validation
             if train_iter % args.valid_niter == 0:
@@ -560,9 +561,6 @@ def train(args):
                 # compute dev. ppl and bleu
                 dev_loss = evaluate_loss(model, dev_data, cross_entropy_loss)
                 dev_ppl = np.exp(dev_loss)
-                print(dev_ppl)
-                model.save('model.bin')
-                exit(1)
                 dev_hyps, dev_bleu = decode(model, dev_data)
 
                 model.train()
