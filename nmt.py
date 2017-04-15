@@ -498,7 +498,7 @@ def evaluate_loss(model, data, crit):
         scores = model(src_words_var, tgt_words_var[:-1])
         loss = crit(scores.view(-1, scores.size(2)), tgt_words_var[1:].view(-1))
 
-        cum_loss += loss
+        cum_loss += loss.data[0]
         cum_tgt_words += pred_tgt_word_num
 
     loss = cum_loss / cum_tgt_words
