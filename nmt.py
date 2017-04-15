@@ -1,19 +1,23 @@
 from __future__ import print_function
 
-import time
 import torch
 import torch.nn as nn
 import torch.nn.utils
-from nltk.translate.bleu_score import corpus_bleu
 from torch.autograd import Variable
 from torch import optim
 from torch.nn import Parameter
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
+from nltk.translate.bleu_score import corpus_bleu
+import time
 import numpy as np
 from collections import defaultdict, Counter, namedtuple
 from itertools import chain, islice
 import argparse, os, sys
+
+from util import read_corpus, data_iter, batch_slice
+from vocab import Vocab, VocabEntry
 
 
 def init_config():
@@ -21,27 +25,25 @@ def init_config():
     parser.add_argument('--seed', default=5783287, type=int)
     parser.add_argument('--cuda', action='store_true', default=False)
     parser.add_argument('--mode', choices=['train', 'test', 'sample'], default='train')
+    parser.add_argument('--vocab', type=str)
     parser.add_argument('--batch_size', default=32, type=int)
     parser.add_argument('--beam_size', default=5, type=int)
     parser.add_argument('--sample_size', default=10, type=int)
     parser.add_argument('--embed_size', default=256, type=int)
     parser.add_argument('--hidden_size', default=256, type=int)
-    parser.add_argument('--attention_size', default=256, type=int)
     parser.add_argument('--dropout', default=0., type=float)
 
-    parser.add_argument('--src_vocab_size', default=20000, type=int)
-    parser.add_argument('--tgt_vocab_size', default=20000, type=int)
-
-    parser.add_argument('--train_src')
-    parser.add_argument('--train_tgt')
-    parser.add_argument('--dev_src')
-    parser.add_argument('--dev_tgt')
-    parser.add_argument('--test_src')
-    parser.add_argument('--test_tgt')
+    parser.add_argument('--train_src', type=str)
+    parser.add_argument('--train_tgt', type=str)
+    parser.add_argument('--dev_src', type=str)
+    parser.add_argument('--dev_tgt', type=str)
+    parser.add_argument('--test_src', type=str)
+    parser.add_argument('--test_tgt', type=str)
 
     parser.add_argument('--decode_max_time_step', default=200, type=int)
 
     parser.add_argument('--valid_niter', default=500, type=int)
+    parser.add_argument('--log_every', default=50, type=int)
     parser.add_argument('--load_model', default=None, type=str)
     parser.add_argument('--save_to', default='model', type=str)
     parser.add_argument('--save_model_after', default=2)
@@ -62,66 +64,6 @@ def init_config():
     np.random.seed(args.seed * 13 / 7)
 
     return args
-
-
-def read_corpus(file_path):
-    data = []
-    for line in open(file_path):
-        sent = line.strip().split(' ')
-        sent = ['<s>'] + sent + ['</s>']
-        data.append(sent)
-
-    return data
-
-
-def build_vocab(data, cutoff):
-    vocab = defaultdict(lambda: 0)
-    vocab['<unk>'] = 0
-    vocab['<s>'] = 1
-    vocab['</s>'] = 2
-    vocab['<pad>'] = 3
-
-    word_freq = Counter(chain(*data))
-    non_singletons = [w for w in word_freq if word_freq[w] > 1 and w not in vocab]  # do not count <unk> in corpus
-    print('number of word types: %d, number of word types w/ frequency > 1: %d' % (len(word_freq), len(non_singletons)))
-
-    top_k_words = sorted(non_singletons, reverse=True, key=word_freq.get)[:cutoff - len(vocab)]
-    for word in top_k_words:
-        if word not in vocab:
-            vocab[word] = len(vocab)
-
-    return vocab
-
-
-def build_id2word_vocab(vocab):
-    return {v: k for k, v in vocab.iteritems()}
-
-
-def batch_slice(data, batch_size):
-    batch_num = int(np.ceil(len(data) / float(batch_size)))
-    for i in xrange(batch_num):
-        cur_batch_size = batch_size if i < batch_num - 1 else len(data) - batch_size * i
-        yield [data[i * batch_size + b][0] for b in range(cur_batch_size)], \
-              [data[i * batch_size + b][1] for b in range(cur_batch_size)]
-
-
-def data_iter(data, batch_size, shuffle=True):
-    buckets = defaultdict(list)
-    for pair in data:
-        src_sent = pair[0]
-        buckets[len(src_sent)].append(pair)
-
-    batched_data = []
-    for src_len in buckets:
-        tuples = buckets[src_len]
-        np.random.shuffle(tuples)
-        batched_data.extend(list(batch_slice(tuples, batch_size)))
-
-    if shuffle:
-        np.random.shuffle(batched_data)
-
-    for batch in batched_data:
-        yield batch
 
 
 def input_transpose(sents, pad_token):
@@ -150,143 +92,141 @@ def tensor_transform(linear, X):
 
 
 class NMT(nn.Module):
-    def __init__(self, args, src_vocab, tgt_vocab, src_vocab_id2word, tgt_vocab_id2word, load_from=None, load_mode=None):
+    def __init__(self, args, vocab):
         super(NMT, self).__init__()
 
         self.args = args
 
-        self.src_vocab = src_vocab
-        self.tgt_vocab = tgt_vocab
+        self.vocab = vocab
 
-        self.src_vocab_id2word = src_vocab_id2word
-        self.tgt_vocab_id2word = tgt_vocab_id2word
-
-        self.src_embed = nn.Embedding(args.src_vocab_size, args.embed_size)
-        self.tgt_embed = nn.Embedding(args.tgt_vocab_size, args.embed_size)
+        self.src_embed = nn.Embedding(len(vocab.src), args.embed_size, padding_idx=vocab.src['<pad>'])
+        self.tgt_embed = nn.Embedding(len(vocab.tgt), args.embed_size, padding_idx=vocab.tgt['<pad>'])
 
         self.encoder_lstm = nn.LSTM(args.embed_size, args.hidden_size / 2, bidirectional=True, dropout=args.dropout)
         self.decoder_lstm = nn.LSTMCell(args.embed_size + args.hidden_size, args.hidden_size)
 
         # prediction layer of the target vocabulary
-        self.readout = nn.Linear(args.embed_size, args.tgt_vocab_size)
+        self.readout = nn.Linear(args.hidden_size, len(vocab.tgt))
 
         # transformation of decoder hidden states and context vectors before reading out target words
-        self.dec_state_linear = nn.Linear(args.hidden_size + args.hidden_size, args.embed_size)
+        # this produces the `attentional vector` in (Luong et al., 2015)
+        self.att_vec_linear = nn.Linear(args.hidden_size * 2, args.embed_size, bias=False)
 
         # transform encoding states to the first state in decoder
         self.dec_init_linear = nn.Linear(args.hidden_size, args.hidden_size)
 
-        # attention
-        self.att_src_linear = nn.Linear(args.hidden_size, args.attention_size, bias=False)
-        self.att_h_linear = nn.Linear(args.hidden_size, args.attention_size, bias=False)
-        self.att_linear = nn.Linear(args.attention_size, 1)
+        # attention: dot product attention
+        # project source encoding to decoder rnn's h space
+        self.att_src_linear = nn.Linear(args.hidden_size, args.hidden_size, bias=False)
 
-        # readout dropout
+        # dropout layer
         self.dropout = nn.Dropout(args.dropout)
 
         # zero all biases
         self.readout.bias.data.zero_()
-        self.dec_state_linear.bias.data.zero_()
         self.dec_init_linear.bias.data.zero_()
-        self.att_linear.bias.data.zero_()
 
-    def forward(self, src_words, tgt_words):
-        src_encodings, init_ctx_vec = self.encode(src_words)
+    def forward(self, src_sents, src_sents_len, tgt_words):
+        src_encodings, init_ctx_vec = self.encode(src_sents, src_sents_len)
         scores = self.decode(src_encodings, init_ctx_vec, tgt_words)
 
         return scores
 
-    def encode(self, src_words, src_masks=None):
+    def encode(self, src_sents, src_sents_len):
         """
-        :param src_words: (src_sent_len, batch_size)
-        :param src_masks: (src_sent_len)
-        :return:
+        :param src_sents: (src_sent_len, batch_size), sorted by the length of the source
+        :param src_sents_len: (src_sent_len)
         """
         # (src_sent_len, batch_size, embed_size)
-        src_word_embed = self.src_embed(src_words)
+        src_word_embed = self.src_embed(src_sents)
+        packed_src_embed = pack_padded_sequence(src_word_embed, src_sents_len)
 
-        # output: (src_sent_len, batch_size, hidden_size * 2)
-        output, (last_state, last_cell) = self.encoder_lstm(src_word_embed)
+        # output: (src_sent_len, batch_size, hidden_size)
+        output, (last_state, last_cell) = self.encoder_lstm(packed_src_embed)
+        output, _ = pad_packed_sequence(output)
 
         # (batch_size, hidden_size * 2)
-        init_ctx_vec = torch.cat([last_cell[0], last_cell[1]], 1)
-        init_ctx_vec = self.dec_init_linear(init_ctx_vec)
+        # decoder initialization vector
+        dec_init_vec = torch.cat([last_cell[0], last_cell[1]], 1)
+        dec_init_vec = self.dec_init_linear(dec_init_vec)
 
-        return output, init_ctx_vec
+        return output, dec_init_vec
 
-    def decode(self, src_encoding, init_ctx_vec, tgt_words):
+    def decode(self, src_encoding, dec_init_vec, tgt_sents):
         """
-        :param src_encoding: (src_sent_len, batch_size, hidden_size * 2)
-        :param init_ctx_vec: (batch_size, hidden_size * 2)
-        :param tgt_words: (tgt_sent_len, batch_size)
+        :param src_encoding: (src_sent_len, batch_size, hidden_size)
+        :param dec_init_vec: (batch_size, hidden_size)
+        :param tgt_sents: (tgt_sent_len, batch_size)
         :return:
         """
-        init_cell = init_ctx_vec
+        init_cell = dec_init_vec
         init_state = F.tanh(init_cell)
-        batch_size = src_encoding.size(1)
-
-        # pre-compute transformations for source sentences in calculating attention score
-        # (src_sent_len, batch_size, attention_size)
-        src_linear_for_att = tensor_transform(self.att_src_linear, src_encoding)
-
         hidden = (init_state, init_cell)
 
-        ctx_tm1 = Variable(init_cell.data.new(batch_size, self.args.hidden_size).zero_(), requires_grad=False)
+        new_tensor = init_cell.data.new
+        batch_size = src_encoding.size(1)
 
-        tgt_word_embed = self.tgt_embed(tgt_words)
+        # (batch_size, src_sent_len, hidden_size)
+        src_encoding = src_encoding.t()
+        # initialize attentional vector
+        att_tm1 = Variable(new_tensor(batch_size, self.args.hidden_size).zero_(), requires_grad=False)
+
+        tgt_word_embed = self.tgt_embed(tgt_sents)
         scores = []
 
-        # start from <S>, until y_{T-1}
+        # start from `<s>`, until y_{T-1}
         for y_tm1_embed in tgt_word_embed.split(split_size=1):
-            x = torch.cat([y_tm1_embed.squeeze(0), ctx_tm1], 1)
+            # input feeding: concate y_tm1 and previous attentional vector
+            x = torch.cat([y_tm1_embed.squeeze(0), att_tm1], 1)
 
             # h_t: (batch_size, hidden_size)
             h_t, cell_t = self.decoder_lstm(x, hidden)
             h_t = self.dropout(h_t)
 
-            ctx_t, alpha_t = self.dot_prod_attention(h_t, src_encoding, src_linear_for_att)
+            ctx_t, alpha_t = self.dot_prod_attention(h_t, src_encoding)
 
-            read_out = F.tanh(self.dec_state_linear(torch.cat([h_t, ctx_t], 1)))
-            read_out = self.dropout(read_out)
+            att_t = F.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t], 1)))   # E.q. (5)
+            att_t = self.dropout(att_t)
 
-            score_t = self.readout(read_out)
+            score_t = self.readout(att_t)   # E.q. (6)
             scores.append(score_t)
 
-            ctx_tm1 = ctx_t
+            att_tm1 = att_t
             hidden = h_t, cell_t
 
         scores = torch.stack(scores)
         return scores
 
-    def translate(self, src_sent, beam_size=None, to_word=True):
-        if not type(src_sent[0]) == list:
-            src_sent = [src_sent]
+    def translate(self, src_sents, beam_size=None, to_word=True):
+        """
+        perform beam search
+        TODO: batched beam search
+        """
+        src_sents = word2id(src_sents, self.vocab.src)
+        if not type(src_sents[0]) == list:
+            src_sents = [src_sents]
         if not beam_size:
             beam_size = args.beam_size
 
-        src_words, src_word_masks = input_transpose(src_sent, self.src_vocab['<pad>'])
-        src_words = Variable(torch.LongTensor(src_words), volatile=True)
-        if args.cuda:
-            src_words = src_words.cuda()
+        src_sents_var = to_input_variable(src_sents, self.vocab.src, cuda=args.cuda, is_test=True)
 
-        src_encoding, init_ctx_vec = self.encode(src_words)
+        src_encoding, init_ctx_vec = self.encode(src_sents_var, [len(src_sents[0])])
 
         init_cell = init_ctx_vec
         init_state = F.tanh(init_cell)
-
-        # pre-compute transformations for source sentences in calculating attention score
-        # (src_sent_len, 1, attention_size)
-        src_linear_for_att = tensor_transform(self.att_src_linear, src_encoding)
-
-        ctx_tm1 = Variable(torch.zeros(beam_size, self.args.hidden_size), volatile=True)
-        hyp_scores = Variable(torch.zeros(beam_size), volatile=True)
-        if args.cuda:
-            ctx_tm1 = ctx_tm1.cuda()
-            hyp_scores = hyp_scores.cuda()
         hidden = (init_state.expand(beam_size, init_state.size(1)), init_cell.expand(beam_size, init_cell.size(1)))
 
-        eos_id = self.tgt_vocab['</s>']
-        hypotheses = [[self.tgt_vocab['<s>']] for _ in xrange(beam_size)]
+        att_tm1 = Variable(torch.zeros(beam_size, self.args.hidden_size), volatile=True)
+        hyp_scores = Variable(torch.zeros(beam_size), volatile=True)
+        if args.cuda:
+            att_tm1 = att_tm1.cuda()
+            hyp_scores = hyp_scores.cuda()
+
+        eos_id = self.vocab.tgt['</s>']
+        bos_id = self.vocab.tgt['<s>']
+        tgt_vocab_size = len(self.vocab.tgt)
+
+        hypotheses = [[bos_id] for _ in xrange(beam_size)]
         completed_hypotheses = []
         completed_hypothesis_scores = []
 
@@ -296,7 +236,6 @@ class NMT(nn.Module):
             hyp_num = len(hypotheses)
 
             expanded_src_encoding = src_encoding.expand(src_encoding.size(0), hyp_num, src_encoding.size(2))
-            expanded_src_linear_for_att = src_linear_for_att.expand(src_linear_for_att.size(0), hyp_num, src_linear_for_att.size(2))
 
             y_tm1 = Variable(torch.LongTensor([hyp[-1] for hyp in hypotheses]), volatile=True)
             if args.cuda:
@@ -304,24 +243,24 @@ class NMT(nn.Module):
 
             y_tm1_embed = self.tgt_embed(y_tm1)
 
-            x = torch.cat([y_tm1_embed, ctx_tm1], 1)
+            x = torch.cat([y_tm1_embed, att_tm1], 1)
 
             # h_t: (hyp_num, hidden_size)
             h_t, cell_t = self.decoder_lstm(x, hidden)
             h_t = self.dropout(h_t)
 
-            ctx_t, alpha_t = self.dot_prod_attention(h_t, expanded_src_encoding, expanded_src_linear_for_att)
+            ctx_t, alpha_t = self.dot_prod_attention(h_t, expanded_src_encoding.t())
 
-            read_out = F.tanh(self.dec_state_linear(torch.cat([h_t, ctx_t], 1)))
-            read_out = self.dropout(read_out)
+            att_t = F.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t], 1)))
+            att_t = self.dropout(att_t)
 
-            score_t = self.readout(read_out)
+            score_t = self.readout(att_t)
             p_t = F.log_softmax(score_t)
 
             new_hyp_scores = (hyp_scores.unsqueeze(1).expand_as(p_t) + p_t).view(-1)
             top_new_hyp_scores, top_new_hyp_pos = torch.topk(new_hyp_scores, k=hyp_num)
-            prev_hyp_ids = top_new_hyp_pos / args.tgt_vocab_size
-            word_ids = top_new_hyp_pos % args.tgt_vocab_size
+            prev_hyp_ids = top_new_hyp_pos / tgt_vocab_size
+            word_ids = top_new_hyp_pos % tgt_vocab_size
             new_hyp_scores = new_hyp_scores[top_new_hyp_pos.data]
 
             new_hypotheses = []
@@ -344,7 +283,8 @@ class NMT(nn.Module):
                 live_hyp_ids = live_hyp_ids.cuda()
 
             hidden = (h_t[live_hyp_ids], cell_t[live_hyp_ids])
-            ctx_tm1 = ctx_t[live_hyp_ids]
+            att_tm1 = att_t[live_hyp_ids]
+
             hyp_scores = new_hyp_scores[live_hyp_ids]
             hypotheses = new_hypotheses
 
@@ -354,7 +294,7 @@ class NMT(nn.Module):
 
         if to_word:
             for i, hyp in enumerate(completed_hypotheses):
-                completed_hypotheses[i] = [self.tgt_vocab_id2word[w] for w in hyp]
+                completed_hypotheses[i] = [self.vocab.tgt.id2word[w] for w in hyp]
 
         ranked_hypotheses = sorted(zip(completed_hypotheses, completed_hypothesis_scores), key=lambda x: x[1], reverse=True)
 
@@ -462,28 +402,57 @@ class NMT(nn.Module):
         att_hidden = F.tanh(self.att_h_linear(h_t).unsqueeze(0).expand_as(src_linear_for_att) + src_linear_for_att)
 
         # (batch_size, src_sent_len)
-        att_weights = F.softmax(tensor_transform(self.att_linear, att_hidden).squeeze(2).permute(1, 0))
+        att_weights = F.softmax(tensor_transform(self.att_vec_linear, att_hidden).squeeze(2).permute(1, 0))
 
         # (batch_size, hidden_size * 2)
         ctx_vec = torch.bmm(src_encoding.permute(1, 2, 0), att_weights.unsqueeze(2)).squeeze(2)
 
         return ctx_vec, att_weights
 
-    def dot_prod_attention(self, h_t, src_encoding, src_linear_for_att):
-        h_t_linear = self.att_h_linear(h_t).unsqueeze(2)  # batch x dim x 1
+    def dot_prod_attention(self, h_t, src_encoding, mask=None):
+        """
+        :param h_t: (batch_size, hidden_size)
+        :param src_encoding: (batch_size, src_sent_len, hidden_size)
+        :param mask: (batch_size, src_sent_len)
+        """
+        # (batch_size, hidden_size, 1)
+        h_t_linear = self.att_src_linear(h_t).unsqueeze(2)
 
-        src_encoding = src_encoding.t()
-        attn = F.softmax(torch.bmm(src_encoding, h_t_linear).squeeze(2))  # batch x sourceL
-        attn3 = attn.view(attn.size(0), 1, attn.size(1))  # batch x 1 x sourceL
+        # (batch_size, src_sent_len)
+        att_weight = torch.bmm(src_encoding, h_t_linear).squeeze(2)
+        if mask:
+            att_weight.data.masked_fill_(mask, -float('inf'))
+        att_weight = F.softmax(att_weight)
 
-        ctx_vec = torch.bmm(attn3, src_encoding).squeeze(1)  # batch x dim
+        att_view = (att_weight.size(0), 1, att_weight.size(1))
+        # (batch_size, hidden_size)
+        ctx_vec = torch.bmm(att_weight.view(*att_view), src_encoding).squeeze(1)
 
-        return ctx_vec, attn
-
+        return ctx_vec, att_weight
 
     def save(self, path):
         print('save parameters to [%s]' % path, file=sys.stderr)
-        torch.save(self.state_dict(), path)
+        params = {
+            'args': self.args,
+            'vocab': self.vocab,
+            'state_dict': self.state_dict()
+        }
+        torch.save(params, path)
+
+
+def to_input_variable(sents, vocab, cuda=False, is_test=False):
+    """
+    return a tensor of shape (src_sent_len, batch_size)
+    """
+
+    word_ids = word2id(sents, vocab)
+    sents_t, masks = input_transpose(word_ids, vocab['<pad>'])
+
+    sents_var = Variable(torch.LongTensor(sents_t), volatile=is_test, requires_grad=False)
+    if cuda:
+        sents_var = sents_var.cuda()
+
+    return sents_var
 
 
 def evaluate_loss(model, data, crit):
@@ -491,24 +460,15 @@ def evaluate_loss(model, data, crit):
     cum_loss = 0.
     cum_tgt_words = 0.
     for src_sents, tgt_sents in data_iter(data, batch_size=args.batch_size, shuffle=False):
-        src_word_ids = word2id(src_sents, model.src_vocab)
-        tgt_word_ids = word2id(tgt_sents, model.tgt_vocab)
-
         pred_tgt_word_num = sum(len(s[1:]) for s in tgt_sents) # omitting leading `<s>`
+        src_sents_len = [len(s) for s in src_sents]
 
-        src_words, src_masks = input_transpose(src_word_ids, model.src_vocab['<pad>'])
-        tgt_words, tgt_masks = input_transpose(tgt_word_ids, model.tgt_vocab['<pad>'])
-
-        src_words_var = Variable(torch.LongTensor(src_words), volatile=True)
-        tgt_words_var = Variable(torch.LongTensor(tgt_words), volatile=True)
-
-        if args.cuda:
-            src_words_var = src_words_var.cuda()
-            tgt_words_var = tgt_words_var.cuda()
+        src_sents_var = to_input_variable(src_sents, model.vocab.src, cuda=args.cuda, is_test=True)
+        tgt_sents_var = to_input_variable(tgt_sents, model.vocab.tgt, cuda=args.cuda, is_test=True)
 
         # (tgt_sent_len, batch_size, tgt_vocab_size)
-        scores = model(src_words_var, tgt_words_var[:-1])
-        loss = crit(scores.view(-1, scores.size(2)), tgt_words_var[1:].view(-1))
+        scores = model(src_sents_var, src_sents_len, tgt_sents_var[:-1])
+        loss = crit(scores.view(-1, scores.size(2)), tgt_sents_var[1:].view(-1))
 
         cum_loss += loss.data[0]
         cum_tgt_words += pred_tgt_word_num
@@ -518,23 +478,22 @@ def evaluate_loss(model, data, crit):
 
 
 def train(args):
-    train_data_src = read_corpus(args.train_src)
-    train_data_tgt = read_corpus(args.train_tgt)
+    train_data_src = read_corpus(args.train_src, source='src')
+    train_data_tgt = read_corpus(args.train_tgt, source='tgt')
 
-    dev_data_src = read_corpus(args.dev_src)
-    dev_data_tgt = read_corpus(args.dev_tgt)
+    dev_data_src = read_corpus(args.dev_src, source='src')
+    dev_data_tgt = read_corpus(args.dev_tgt, source='tgt')
 
-    src_vocab = build_vocab(train_data_src, args.src_vocab_size)
-    tgt_vocab = build_vocab(train_data_tgt, args.tgt_vocab_size)
+    train_data = zip(train_data_src, train_data_tgt)
+    dev_data = zip(dev_data_src, dev_data_tgt)
 
-    src_vocab_id2word = build_id2word_vocab(src_vocab)
-    tgt_vocab_id2word = build_id2word_vocab(tgt_vocab)
+    vocab = torch.load(args.vocab)
 
-    model = NMT(args, src_vocab, tgt_vocab, src_vocab_id2word, tgt_vocab_id2word)
+    model = NMT(args, vocab)
     model.train()
 
-    vocab_mask = torch.ones(args.tgt_vocab_size)
-    vocab_mask[tgt_vocab['<pad>']] = 0
+    vocab_mask = torch.ones(len(vocab.tgt))
+    vocab_mask[vocab.tgt['<pad>']] = 0
     cross_entropy_loss = nn.CrossEntropyLoss(weight=vocab_mask, size_average=False)
 
     if args.cuda:
@@ -543,34 +502,57 @@ def train(args):
 
     optimizer = torch.optim.Adam(model.parameters())
 
-    train_data = zip(train_data_src, train_data_tgt)
-    dev_data = zip(dev_data_src, dev_data_tgt)
     train_iter = patience = cum_loss = cum_tgt_words = cum_examples = epoch = valid_num = best_model_iter = 0
     hist_valid_scores = []
-    train_time = time.time()
+    train_time = begin_time = time.time()
     print('begin Maximum Likelihood training')
 
     while True:
         epoch += 1
         for src_sents, tgt_sents in data_iter(train_data, batch_size=args.batch_size):
             train_iter += 1
-            src_word_ids = word2id(src_sents, src_vocab)
-            tgt_word_ids = word2id(tgt_sents, tgt_vocab)
+
+            src_sents_var = to_input_variable(src_sents, vocab.src, cuda=args.cuda)
+            tgt_sents_var = to_input_variable(tgt_sents, vocab.tgt, cuda=args.cuda)
 
             batch_size = len(src_sents)
+            src_sents_len = [len(s) for s in src_sents]
             pred_tgt_word_num = sum(len(s[1:]) for s in tgt_sents) # omitting leading `<s>`
 
-            if train_iter % args.valid_niter == 0:
-                valid_num += 1
-                print('epoch %d, iter %d, avg. loss %f, avg. ppl %f ' \
-                      'cum. examples %d, time elapsed %f(s)' % (epoch, train_iter,
-                                                                cum_loss / cum_examples,
-                                                                np.exp(cum_loss / cum_tgt_words),
-                                                                cum_examples,
-                                                                time.time() - train_time), file=sys.stderr)
+            optimizer.zero_grad()
+
+            # (tgt_sent_len, batch_size, tgt_vocab_size)
+            scores = model(src_sents_var, src_sents_len, tgt_sents_var[:-1])
+
+            word_loss = cross_entropy_loss(scores.view(-1, scores.size(2)), tgt_sents_var[1:].view(-1))
+            loss = word_loss / batch_size
+            word_loss_val = word_loss.data[0]
+            loss_val = loss.data[0]
+
+            loss.backward()
+            # clip gradient
+            grad_norm = torch.nn.utils.clip_grad_norm(model.parameters(), args.clip_grad)
+            optimizer.step()
+
+            cum_loss += word_loss_val
+            cum_tgt_words += pred_tgt_word_num
+            cum_examples += batch_size
+
+            if train_iter % args.log_every == 0:
+                print('epoch %d, iter %d, avg. loss %.2f, avg. ppl %.2f ' \
+                      'cum. examples %d, speed %.2f words/sec, time elapsed %.2f sec' % (epoch, train_iter,
+                                                                                         cum_loss / cum_examples,
+                                                                                         np.exp(cum_loss / cum_tgt_words),
+                                                                                         cum_examples,
+                                                                                         cum_tgt_words / (time.time() - train_time),
+                                                                                         time.time() - begin_time), file=sys.stderr)
 
                 train_time = time.time()
                 cum_loss = cum_tgt_words = cum_examples = 0.
+
+            # perform validation
+            if train_iter % args.valid_niter == 0:
+                valid_num += 1
 
                 print('begin validation ...', file=sys.stderr)
                 model.eval()
@@ -578,6 +560,9 @@ def train(args):
                 # compute dev. ppl and bleu
                 dev_loss = evaluate_loss(model, dev_data, cross_entropy_loss)
                 dev_ppl = np.exp(dev_loss)
+                print(dev_ppl)
+                model.save('model.bin')
+                exit(1)
                 dev_hyps, dev_bleu = decode(model, dev_data)
 
                 model.train()
@@ -614,49 +599,6 @@ def train(args):
                         print('the best model is from iteration [%d]' % best_model_iter, file=sys.stderr)
                         exit(0)
 
-            optimizer.zero_grad()
-
-            src_words, src_masks = input_transpose(src_word_ids, src_vocab['<pad>'])
-            tgt_words, tgt_masks = input_transpose(tgt_word_ids, tgt_vocab['<pad>'])
-
-            src_words_var = Variable(torch.LongTensor(src_words), requires_grad=False)
-            tgt_words_var = Variable(torch.LongTensor(tgt_words), requires_grad=False)
-
-            if args.cuda:
-                src_words_var = src_words_var.cuda()
-                tgt_words_var = tgt_words_var.cuda()
-
-            # (tgt_sent_len, batch_size, tgt_vocab_size)
-            scores = model(src_words_var, tgt_words_var[:-1])
-            loss = cross_entropy_loss(scores.view(-1, scores.size(2)), tgt_words_var[1:].view(-1))
-
-            # from <s> to y_{T-1}
-            # for t, (score_t, tgt_y_t) in enumerate(zip(scores.split(32), tgt_words_var[1:].split(32))):
-            #     score_t = score_t.view(-1, score_t.size(2))
-            #     tgt_y_t = tgt_y_t.view(-1)
-            #     loss_t = cross_entropy_loss(score_t, tgt_y_t)
-            #
-            #     losses.append(loss_t)
-
-            # loss = torch.stack(losses).sum()
-
-            ppl = np.exp(loss.data[0] / pred_tgt_word_num)
-            loss /= batch_size
-            loss_val = loss.data[0]
-
-            assert pred_tgt_word_num == tgt_words_var[1:].ne(tgt_vocab['<pad>']).sum()
-
-            print('epoch %d, iter %d, loss=%f, ppl=%f' % (epoch, train_iter, loss_val, ppl))
-
-            loss.backward()
-            # clip gradient
-            grad_norm = torch.nn.utils.clip_grad_norm(model.parameters(), args.clip_grad)
-            optimizer.step()
-
-            cum_loss += loss_val * batch_size
-            cum_tgt_words += pred_tgt_word_num
-            cum_examples += batch_size
-
 
 def get_bleu(references, hypotheses):
     # compute BLEU
@@ -670,8 +612,7 @@ def decode(model, data):
     hypotheses = []
     begin_time = time.time()
     for src_sent, tgt_sent in data:
-        src_sent_wids = word2id(src_sent, model.src_vocab)
-        hyp = model.translate(src_sent_wids)[0]
+        hyp = model.translate(src_sent)[0]
         hypotheses.append(hyp)
         print('*' * 50)
         print('Source: ', ' '.join(src_sent))
@@ -692,28 +633,27 @@ def decode(model, data):
 
 
 def test(args):
-    train_data_src = read_corpus(args.train_src)
-    train_data_tgt = read_corpus(args.train_tgt)
-
-    src_vocab = build_vocab(train_data_src, args.src_vocab_size)
-    tgt_vocab = build_vocab(train_data_tgt, args.tgt_vocab_size)
-
-    src_vocab_id2word = build_id2word_vocab(src_vocab)
-    tgt_vocab_id2word = build_id2word_vocab(tgt_vocab)
-
-    test_data_src = read_corpus(args.test_src)
-    test_data_tgt = read_corpus(args.test_tgt)
-
-    model = NMT(args, src_vocab, tgt_vocab, src_vocab_id2word, tgt_vocab_id2word)
-    model.eval()
+    test_data_src = read_corpus(args.test_src, source='src')
+    test_data_tgt = read_corpus(args.test_tgt, source='tgt')
+    test_data = zip(test_data_src, test_data_tgt)
 
     if args.load_model:
         print('load model from [%s]' % args.load_model, file=sys.stderr)
-        model.load_state_dict(torch.load(args.load_model, map_location=lambda storage, loc: storage))
+        params = torch.load(args.load_model, map_location=lambda storage, loc: storage)
+        vocab = params['vocab']
+        args = params['args']
+        state_dict = params['state_dict']
+
+        model = NMT(args, vocab)
+        model.load_state_dict(state_dict)
+    else:
+        vocab = torch.load(args.vocab)
+        model = NMT(args, vocab)
+
+    model.eval()
+
     if args.cuda:
         model = model.cuda()
-
-    test_data = zip(test_data_src, test_data_tgt)
 
     hypotheses, bleu_score = decode(model, test_data)
 
@@ -765,6 +705,7 @@ def sample(args):
         # for i, sample in enumerate(samples, 1):
         #     print('[%d] %s' % (i, ' '.join(sample[1:-1])))
         # print('*' * 80)
+
 
 if __name__ == '__main__':
     args = init_config()
