@@ -164,20 +164,20 @@ class NMT(nn.Module):
         self.src_embed = nn.Embedding(args.src_vocab_size, args.embed_size)
         self.tgt_embed = nn.Embedding(args.tgt_vocab_size, args.embed_size)
 
-        self.encoder_lstm = nn.LSTM(args.embed_size, args.hidden_size, bidirectional=True, dropout=args.dropout)
-        self.decoder_lstm = nn.LSTMCell(args.embed_size + args.hidden_size * 2, args.hidden_size)
+        self.encoder_lstm = nn.LSTM(args.embed_size, args.hidden_size / 2, bidirectional=True, dropout=args.dropout)
+        self.decoder_lstm = nn.LSTMCell(args.embed_size + args.hidden_size, args.hidden_size)
 
         # prediction layer of the target vocabulary
         self.readout = nn.Linear(args.embed_size, args.tgt_vocab_size)
 
         # transformation of decoder hidden states and context vectors before reading out target words
-        self.dec_state_linear = nn.Linear(args.hidden_size + args.hidden_size * 2, args.embed_size)
+        self.dec_state_linear = nn.Linear(args.hidden_size + args.hidden_size, args.embed_size)
 
         # transform encoding states to the first state in decoder
-        self.dec_init_linear = nn.Linear(args.hidden_size * 2, args.hidden_size)
+        self.dec_init_linear = nn.Linear(args.hidden_size, args.hidden_size)
 
         # attention
-        self.att_src_linear = nn.Linear(args.hidden_size * 2, args.attention_size, bias=False)
+        self.att_src_linear = nn.Linear(args.hidden_size, args.attention_size, bias=False)
         self.att_h_linear = nn.Linear(args.hidden_size, args.attention_size, bias=False)
         self.att_linear = nn.Linear(args.attention_size, 1)
 
@@ -231,7 +231,7 @@ class NMT(nn.Module):
 
         hidden = (init_state, init_cell)
 
-        ctx_tm1 = Variable(init_cell.data.new(batch_size, self.args.hidden_size * 2).zero_(), requires_grad=False)
+        ctx_tm1 = Variable(init_cell.data.new(batch_size, self.args.hidden_size).zero_(), requires_grad=False)
 
         tgt_word_embed = self.tgt_embed(tgt_words)
         scores = []
@@ -244,7 +244,7 @@ class NMT(nn.Module):
             h_t, cell_t = self.decoder_lstm(x, hidden)
             h_t = self.dropout(h_t)
 
-            ctx_t, alpha_t = self.attention(h_t, src_encoding, src_linear_for_att)
+            ctx_t, alpha_t = self.dot_prod_attention(h_t, src_encoding, src_linear_for_att)
 
             read_out = F.tanh(self.dec_state_linear(torch.cat([h_t, ctx_t], 1)))
             read_out = self.dropout(read_out)
@@ -278,7 +278,7 @@ class NMT(nn.Module):
         # (src_sent_len, 1, attention_size)
         src_linear_for_att = tensor_transform(self.att_src_linear, src_encoding)
 
-        ctx_tm1 = Variable(torch.zeros(beam_size, self.args.hidden_size * 2), volatile=True)
+        ctx_tm1 = Variable(torch.zeros(beam_size, self.args.hidden_size), volatile=True)
         hyp_scores = Variable(torch.zeros(beam_size), volatile=True)
         if args.cuda:
             ctx_tm1 = ctx_tm1.cuda()
@@ -468,6 +468,18 @@ class NMT(nn.Module):
         ctx_vec = torch.bmm(src_encoding.permute(1, 2, 0), att_weights.unsqueeze(2)).squeeze(2)
 
         return ctx_vec, att_weights
+
+    def dot_prod_attention(self, h_t, src_encoding, src_linear_for_att):
+        h_t_linear = self.att_h_linear(h_t).unsqueeze(2)  # batch x dim x 1
+
+        src_encoding = src_encoding.t()
+        attn = F.softmax(torch.bmm(src_encoding, h_t_linear).squeeze(2))  # batch x sourceL
+        attn3 = attn.view(attn.size(0), 1, attn.size(1))  # batch x 1 x sourceL
+
+        ctx_vec = torch.bmm(attn3, src_encoding).squeeze(1)  # batch x dim
+
+        return ctx_vec, attn
+
 
     def save(self, path):
         print('save parameters to [%s]' % path, file=sys.stderr)
