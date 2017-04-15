@@ -163,7 +163,7 @@ class NMT(nn.Module):
         self.tgt_embed = nn.Embedding(args.tgt_vocab_size, args.embed_size)
 
         self.encoder_lstm = nn.LSTM(args.embed_size, args.hidden_size, bidirectional=True, dropout=args.dropout)
-        self.decoder_lstm = nn.LSTMCell(args.embed_size + args.hidden_size * 2, args.hidden_size, dropout=args.dropout)
+        self.decoder_lstm = nn.LSTMCell(args.embed_size + args.hidden_size * 2, args.hidden_size)
 
         # prediction layer of the target vocabulary
         self.readout = nn.Linear(args.embed_size, args.tgt_vocab_size)
@@ -240,6 +240,7 @@ class NMT(nn.Module):
 
             # h_t: (batch_size, hidden_size)
             h_t, cell_t = self.decoder_lstm(x, hidden)
+            h_t = self.dropout(h_t)
 
             ctx_t, alpha_t = self.attention(h_t, src_encoding, src_linear_for_att)
 
@@ -305,6 +306,7 @@ class NMT(nn.Module):
 
             # h_t: (hyp_num, hidden_size)
             h_t, cell_t = self.decoder_lstm(x, hidden)
+            h_t = self.dropout(h_t)
 
             ctx_t, alpha_t = self.attention(h_t, expanded_src_encoding, expanded_src_linear_for_att)
 
@@ -421,6 +423,7 @@ class NMT(nn.Module):
 
             # h_t: (batch_size, hidden_size)
             h_t, cell_t = self.decoder_lstm(x, hidden)
+            h_t = self.dropout(h_t)
 
             ctx_t, alpha_t = self.attention(h_t, src_encoding, src_linear_for_att)
 
