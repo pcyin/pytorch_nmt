@@ -46,6 +46,6 @@ def data_iter(data, batch_size, shuffle=True):
         batched_data.extend(list(batch_slice(tuples, batch_size)))
 
     if shuffle:
-        np.random.shuffle(data)
+        np.random.shuffle(batched_data)
     for batch in batched_data:
         yield batch
