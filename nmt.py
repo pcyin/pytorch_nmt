@@ -106,9 +106,6 @@ class NMT(nn.Module):
         self.encoder_lstm = nn.LSTM(args.embed_size, args.hidden_size / 2, bidirectional=True, dropout=args.dropout)
         self.decoder_lstm = nn.LSTMCell(args.embed_size + args.hidden_size, args.hidden_size)
 
-        # transform encoding states to the first state in decoder
-        self.dec_init_linear = nn.Linear(args.hidden_size, args.hidden_size)
-
         # attention: dot product attention
         # project source encoding to decoder rnn's h space
         self.att_src_linear = nn.Linear(args.hidden_size, args.hidden_size, bias=False)
@@ -118,14 +115,10 @@ class NMT(nn.Module):
         self.att_vec_linear = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
 
         # prediction layer of the target vocabulary
-        self.readout = nn.Linear(args.hidden_size, len(vocab.tgt))
+        self.readout = nn.Linear(args.hidden_size, len(vocab.tgt), bias=False)
 
         # dropout layer
         self.dropout = nn.Dropout(args.dropout)
-
-        # zero all biases
-        self.dec_init_linear.bias.data.zero_()
-        self.readout.bias.data.zero_()
 
     def forward(self, src_sents, src_sents_len, tgt_words):
         src_encodings, init_ctx_vec = self.encode(src_sents, src_sents_len)
@@ -146,12 +139,10 @@ class NMT(nn.Module):
         output, (last_state, last_cell) = self.encoder_lstm(packed_src_embed)
         output, _ = pad_packed_sequence(output)
 
-        # (batch_size, hidden_size * 2)
-        # decoder initialization vector
-        dec_init_vec = torch.cat([last_cell[0], last_cell[1]], 1)
-        dec_init_vec = self.dec_init_linear(dec_init_vec)
+        dec_init_state = torch.cat([last_state[0], last_state[1]], 1)
+        dec_init_cell = torch.cat([last_cell[0], last_cell[1]], 1)
 
-        return output, dec_init_vec
+        return output, (dec_init_state, dec_init_cell)
 
     def decode(self, src_encoding, dec_init_vec, tgt_sents):
         """
@@ -160,8 +151,8 @@ class NMT(nn.Module):
         :param tgt_sents: (tgt_sent_len, batch_size)
         :return:
         """
-        init_cell = dec_init_vec
-        init_state = F.tanh(init_cell)
+        init_state = dec_init_vec[0]
+        init_cell = dec_init_vec[1]
         hidden = (init_state, init_cell)
 
         new_tensor = init_cell.data.new
@@ -210,10 +201,10 @@ class NMT(nn.Module):
 
         src_sents_var = to_input_variable(src_sents, self.vocab.src, cuda=args.cuda, is_test=True)
 
-        src_encoding, init_ctx_vec = self.encode(src_sents_var, [len(src_sents[0])])
+        src_encoding, dec_init_vec = self.encode(src_sents_var, [len(src_sents[0])])
 
-        init_cell = init_ctx_vec
-        init_state = F.tanh(init_cell)
+        init_state = dec_init_vec[0]
+        init_cell = dec_init_vec[1]
         hidden = (init_state.expand(beam_size, init_state.size(1)), init_cell.expand(beam_size, init_cell.size(1)))
 
         att_tm1 = Variable(torch.zeros(beam_size, self.args.hidden_size), volatile=True)
