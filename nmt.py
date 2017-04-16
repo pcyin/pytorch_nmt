@@ -43,6 +43,7 @@ def init_config():
     parser.add_argument('--decode_max_time_step', default=200, type=int)
 
     parser.add_argument('--valid_niter', default=500, type=int)
+    parser.add_argument('--valid_metric', default='bleu', choices=['bleu', 'ppl'])
     parser.add_argument('--log_every', default=50, type=int)
     parser.add_argument('--load_model', default=None, type=str)
     parser.add_argument('--save_to', default='model', type=str)
@@ -52,7 +53,7 @@ def init_config():
     parser.add_argument('--uniform_init', default=None, type=float)
     parser.add_argument('--clip_grad', default=5., type=float)
     parser.add_argument('--max_niter', default=-1, type=int)
-    parser.add_argument('--lr_decay', default=None, type=float)
+    parser.add_argument('--lr_decay', default=0.5, type=float)
 
     parser.add_argument('--sample_method', default='expand')
 
@@ -568,16 +569,24 @@ def train(args):
                 model.eval()
 
                 # compute dev. ppl and bleu
+
                 dev_loss = evaluate_loss(model, dev_data, cross_entropy_loss)
                 dev_ppl = np.exp(dev_loss)
-                dev_hyps, dev_bleu = decode(model, dev_data)
+
+                if args.valid_metric == 'bleu':
+                    dev_hyps, valid_metric = decode(model, dev_data)
+                    print('validation: iter %d, dev. ppl %f, dev. bleu %f' % (train_iter, dev_ppl, valid_metric),
+                          file=sys.stderr)
+                else:
+                    valid_metric = -dev_ppl
+                    print('validation: iter %d, dev. ppl %f' % (train_iter, dev_ppl),
+                          file=sys.stderr)
 
                 model.train()
-                print('validation: iter %d, dev. ppl %f, dev. bleu %f' % (train_iter, dev_ppl, dev_bleu), file=sys.stderr)
 
-                is_better = len(hist_valid_scores) == 0 or dev_bleu > max(hist_valid_scores)
-                is_better_than_last = len(hist_valid_scores) == 0 or dev_bleu > hist_valid_scores[-1]
-                hist_valid_scores.append(dev_bleu)
+                is_better = len(hist_valid_scores) == 0 or valid_metric > max(hist_valid_scores)
+                is_better_than_last = len(hist_valid_scores) == 0 or valid_metric > hist_valid_scores[-1]
+                hist_valid_scores.append(valid_metric)
 
                 if valid_num > args.save_model_after:
                     model_file = args.save_to + '.iter%d.bin' % train_iter
