@@ -49,6 +49,7 @@ def init_config():
     parser.add_argument('--save_model_after', default=2)
     parser.add_argument('--save_to_file', default=None, type=str)
     parser.add_argument('--patience', default=5, type=int)
+    parser.add_argument('--uniform_init', default=None, type=float)
     parser.add_argument('--clip_grad', default=5., type=float)
     parser.add_argument('--max_niter', default=-1, type=int)
     parser.add_argument('--lr_decay', default=None, type=float)
@@ -494,6 +495,11 @@ def train(args):
 
     model = NMT(args, vocab)
     model.train()
+
+    if args.uniform_init:
+        print('uniformly initialize parameters [-%f, +%f]' % (args.uniform_init, args.uniform_init), file=sys.stderr)
+        for p in model.parameters():
+            p.data.uniform_(-args.uniform_init, args.uniform_init)
 
     vocab_mask = torch.ones(len(vocab.tgt))
     vocab_mask[vocab.tgt['<pad>']] = 0
