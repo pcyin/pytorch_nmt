@@ -105,13 +105,6 @@ class NMT(nn.Module):
         self.encoder_lstm = nn.LSTM(args.embed_size, args.hidden_size / 2, bidirectional=True, dropout=args.dropout)
         self.decoder_lstm = nn.LSTMCell(args.embed_size + args.hidden_size, args.hidden_size)
 
-        # prediction layer of the target vocabulary
-        self.readout = nn.Linear(args.hidden_size, len(vocab.tgt))
-
-        # transformation of decoder hidden states and context vectors before reading out target words
-        # this produces the `attentional vector` in (Luong et al., 2015)
-        self.att_vec_linear = nn.Linear(args.hidden_size * 2, args.embed_size, bias=False)
-
         # transform encoding states to the first state in decoder
         self.dec_init_linear = nn.Linear(args.hidden_size, args.hidden_size)
 
@@ -119,12 +112,19 @@ class NMT(nn.Module):
         # project source encoding to decoder rnn's h space
         self.att_src_linear = nn.Linear(args.hidden_size, args.hidden_size, bias=False)
 
+        # transformation of decoder hidden states and context vectors before reading out target words
+        # this produces the `attentional vector` in (Luong et al., 2015)
+        self.att_vec_linear = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
+
+        # prediction layer of the target vocabulary
+        self.readout = nn.Linear(args.hidden_size, len(vocab.tgt))
+
         # dropout layer
         self.dropout = nn.Dropout(args.dropout)
 
         # zero all biases
-        self.readout.bias.data.zero_()
         self.dec_init_linear.bias.data.zero_()
+        self.readout.bias.data.zero_()
 
     def forward(self, src_sents, src_sents_len, tgt_words):
         src_encodings, init_ctx_vec = self.encode(src_sents, src_sents_len)
@@ -202,7 +202,6 @@ class NMT(nn.Module):
         perform beam search
         TODO: batched beam search
         """
-        src_sents = word2id(src_sents, self.vocab.src)
         if not type(src_sents[0]) == list:
             src_sents = [src_sents]
         if not beam_size:
@@ -261,12 +260,13 @@ class NMT(nn.Module):
             top_new_hyp_scores, top_new_hyp_pos = torch.topk(new_hyp_scores, k=hyp_num)
             prev_hyp_ids = top_new_hyp_pos / tgt_vocab_size
             word_ids = top_new_hyp_pos % tgt_vocab_size
-            new_hyp_scores = new_hyp_scores[top_new_hyp_pos.data]
+            # new_hyp_scores = new_hyp_scores[top_new_hyp_pos.data]
 
             new_hypotheses = []
 
             live_hyp_ids = []
-            for prev_hyp_id, word_id, new_hyp_score in zip(prev_hyp_ids.cpu().data, word_ids.cpu().data, new_hyp_scores.cpu().data):
+            new_hyp_scores = []
+            for prev_hyp_id, word_id, new_hyp_score in zip(prev_hyp_ids.cpu().data, word_ids.cpu().data, top_new_hyp_scores.cpu().data):
                 hyp_tgt_words = hypotheses[prev_hyp_id] + [word_id]
                 if word_id == eos_id:
                     completed_hypotheses.append(hyp_tgt_words)
@@ -274,6 +274,7 @@ class NMT(nn.Module):
                 else:
                     new_hypotheses.append(hyp_tgt_words)
                     live_hyp_ids.append(prev_hyp_id)
+                    new_hyp_scores.append(new_hyp_score)
 
             if len(completed_hypotheses) == beam_size:
                 break
@@ -285,7 +286,9 @@ class NMT(nn.Module):
             hidden = (h_t[live_hyp_ids], cell_t[live_hyp_ids])
             att_tm1 = att_t[live_hyp_ids]
 
-            hyp_scores = new_hyp_scores[live_hyp_ids]
+            hyp_scores = Variable(torch.FloatTensor(new_hyp_scores), volatile=True) # new_hyp_scores[live_hyp_ids]
+            if args.cuda:
+                hyp_scores = hyp_scores.cuda()
             hypotheses = new_hypotheses
 
         if len(completed_hypotheses) == 0:
@@ -502,7 +505,7 @@ def train(args):
 
     optimizer = torch.optim.Adam(model.parameters())
 
-    train_iter = patience = log_cum_loss = log_tgt_words = cum_examples = log_cum_examples = epoch = valid_num = best_model_iter = 0
+    train_iter = patience = cum_loss = report_loss = cum_tgt_words = report_tgt_words = cum_examples = cum_batches = report_examples = epoch = valid_num = best_model_iter = 0
     hist_valid_scores = []
     train_time = begin_time = time.time()
     print('begin Maximum Likelihood training')
@@ -534,25 +537,34 @@ def train(args):
             grad_norm = torch.nn.utils.clip_grad_norm(model.parameters(), args.clip_grad)
             optimizer.step()
 
-            log_cum_loss += word_loss_val
-            log_tgt_words += pred_tgt_word_num
-            log_cum_examples += batch_size
+            report_loss += word_loss_val
+            cum_loss += word_loss_val
+            report_tgt_words += pred_tgt_word_num
+            cum_tgt_words += pred_tgt_word_num
+            report_examples += batch_size
             cum_examples += batch_size
+            cum_batches += batch_size
 
             if train_iter % args.log_every == 0:
                 print('epoch %d, iter %d, avg. loss %.2f, avg. ppl %.2f ' \
                       'cum. examples %d, speed %.2f words/sec, time elapsed %.2f sec' % (epoch, train_iter,
-                                                                                         log_cum_loss / log_cum_examples,
-                                                                                         np.exp(log_cum_loss / log_tgt_words),
+                                                                                         report_loss / report_examples,
+                                                                                         np.exp(report_loss / report_tgt_words),
                                                                                          cum_examples,
-                                                                                         log_tgt_words / (time.time() - train_time),
+                                                                                         report_tgt_words / (time.time() - train_time),
                                                                                          time.time() - begin_time), file=sys.stderr)
 
                 train_time = time.time()
-                log_cum_loss = log_tgt_words = log_cum_examples = 0.
+                report_loss = report_tgt_words = report_examples = 0.
 
             # perform validation
             if train_iter % args.valid_niter == 0:
+                print('epoch %d, iter %d, cum. loss %.2f, cum. ppl %.2f cum. examples %d' % (epoch, train_iter,
+                                                                                         cum_loss / cum_batches,
+                                                                                         np.exp(cum_loss / cum_tgt_words),
+                                                                                         cum_examples), file=sys.stderr)
+
+                cum_loss = cum_batches = cum_tgt_words = 0.
                 valid_num += 1
 
                 print('begin validation ...', file=sys.stderr)
