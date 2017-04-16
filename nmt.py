@@ -206,10 +206,10 @@ class NMT(nn.Module):
 
         init_state = dec_init_vec[0]
         init_cell = dec_init_vec[1]
-        hidden = (init_state.expand(beam_size, init_state.size(1)), init_cell.expand(beam_size, init_cell.size(1)))
+        hidden = (init_state, init_cell)
 
-        att_tm1 = Variable(torch.zeros(beam_size, self.args.hidden_size), volatile=True)
-        hyp_scores = Variable(torch.zeros(beam_size), volatile=True)
+        att_tm1 = Variable(torch.zeros(1, self.args.hidden_size), volatile=True)
+        hyp_scores = Variable(torch.zeros(1), volatile=True)
         if args.cuda:
             att_tm1 = att_tm1.cuda()
             hyp_scores = hyp_scores.cuda()
@@ -218,7 +218,7 @@ class NMT(nn.Module):
         bos_id = self.vocab.tgt['<s>']
         tgt_vocab_size = len(self.vocab.tgt)
 
-        hypotheses = [[bos_id] for _ in xrange(beam_size)]
+        hypotheses = [[bos_id]]
         completed_hypotheses = []
         completed_hypothesis_scores = []
 
@@ -249,8 +249,9 @@ class NMT(nn.Module):
             score_t = self.readout(att_t)
             p_t = F.log_softmax(score_t)
 
+            live_hyp_num = beam_size - len(completed_hypotheses)
             new_hyp_scores = (hyp_scores.unsqueeze(1).expand_as(p_t) + p_t).view(-1)
-            top_new_hyp_scores, top_new_hyp_pos = torch.topk(new_hyp_scores, k=hyp_num)
+            top_new_hyp_scores, top_new_hyp_pos = torch.topk(new_hyp_scores, k=live_hyp_num)
             prev_hyp_ids = top_new_hyp_pos / tgt_vocab_size
             word_ids = top_new_hyp_pos % tgt_vocab_size
             # new_hyp_scores = new_hyp_scores[top_new_hyp_pos.data]
