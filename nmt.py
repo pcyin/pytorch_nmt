@@ -683,6 +683,9 @@ def sample(args):
 
     model.eval()
 
+    if args.cuda:
+        model = model.cuda()
+
     print('begin sampling')
 
     check_every = 10
