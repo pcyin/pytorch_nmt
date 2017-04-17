@@ -297,51 +297,36 @@ class NMT(nn.Module):
 
         return [hyp for hyp, score in ranked_hypotheses]
 
-    def sample(self, src_sent, sample_size=None, to_word=False):
-        if not type(src_sent[0]) == list:
-            src_sent = [src_sent]
+    def sample(self, src_sents, sample_size=None, to_word=False):
+        if not type(src_sents[0]) == list:
+            src_sents = [src_sents]
         if not sample_size:
             sample_size = args.sample_size
 
-        batch_size = len(src_sent) * sample_size
-
-        src_words, src_word_masks = input_transpose(src_sent, self.src_vocab['<pad>'])
-        src_words = Variable(torch.LongTensor(src_words), volatile=True)
-        if args.cuda:
-            src_words = src_words.cuda()
-
-        src_encoding, init_ctx_vec = self.encode(src_words)
+        batch_size = len(src_sents) * sample_size
+        src_sents_var = to_input_variable(src_sents, self.vocab.src, cuda=args.cuda, is_test=True)
+        src_encoding, (dec_init_state, dec_init_cell) = self.encode(src_sents_var, [len(s) for s in src_sents])
 
         # tile everything
         if args.sample_method == 'expand':
             # src_enc: (src_sent_len, sample_size, enc_size)
             # cat result: (src_sent_len, batch_size * sample_size, enc_size)
             src_encoding = torch.cat([src_enc.expand(src_enc.size(0), sample_size, src_enc.size(2)) for src_enc in src_encoding.split(1, dim=1)], 1)
-            init_ctx_vec = torch.cat([init_ctx.expand(sample_size, init_ctx.size(1)) for init_ctx in init_ctx_vec.split(1, dim=0)], 0)
+            dec_init_state = torch.cat([x.expand(sample_size, x.size(1)) for x in dec_init_state.split(1, dim=0)], 0)
+            dec_init_cell = torch.cat([x.expand(sample_size, x.size(1)) for x in dec_init_cell.split(1, dim=0)], 0)
         elif args.sample_method == 'repeat':
             src_encoding = src_encoding.repeat(1, sample_size, 1)
-            init_ctx_vec = init_ctx_vec.repeat(sample_size, 1)
+            dec_init_state = dec_init_state.repeat(sample_size, 1)
+            dec_init_cell = dec_init_cell.repeat(sample_size, 1)
 
-        # src_encoding = src_encoding.expand(src_encoding.size(0), sample_size, src_encoding.size(2)).contiguous()
-        # init_ctx_vec = init_ctx_vec.expand(sample_size, init_ctx_vec.size(1))
+        src_encoding = src_encoding.t()
+        hidden = (dec_init_state, dec_init_cell)
+        new_tensor = dec_init_state.data.new
 
-        init_cell = init_ctx_vec
-        init_state = F.tanh(init_cell)
+        att_tm1 = Variable(new_tensor(batch_size, self.args.hidden_size).zero_(), volatile=True)
+        y_0 = Variable(torch.LongTensor([self.vocab.tgt['<s>'] for _ in xrange(batch_size)]), volatile=True)
 
-        # pre-compute transformations for source sentences in calculating attention score
-        # (src_sent_len, batch_size, attention_size)
-        src_linear_for_att = tensor_transform(self.att_src_linear, src_encoding)
-
-        hidden = (init_state, init_cell)
-
-        if not self.args.cuda:
-            ctx_tm1 = Variable(torch.zeros(batch_size, self.args.hidden_size), volatile=True)
-        else:
-            ctx_tm1 = Variable(torch.zeros(batch_size, self.args.hidden_size), volatile=True).cuda()
-
-        y_0 = Variable(torch.LongTensor([self.tgt_vocab['<s>'] for _ in xrange(batch_size)]), volatile=True)
-
-        eos = self.tgt_vocab['</s>']
+        eos = self.vocab.tgt['</s>']
         eos_batch = torch.LongTensor([eos] * batch_size)
         if args.cuda:
             y_0 = y_0.cuda()
@@ -358,18 +343,18 @@ class NMT(nn.Module):
 
             y_tm1_embed = self.tgt_embed(y_tm1)
 
-            x = torch.cat([y_tm1_embed, ctx_tm1], 1)
+            x = torch.cat([y_tm1_embed, att_tm1], 1)
 
             # h_t: (batch_size, hidden_size)
             h_t, cell_t = self.decoder_lstm(x, hidden)
             h_t = self.dropout(h_t)
 
-            ctx_t, alpha_t = self.dot_prod_attention(h_t, src_encoding, src_linear_for_att)
+            ctx_t, alpha_t = self.dot_prod_attention(h_t, src_encoding)
 
-            read_out = F.tanh(self.dec_state_linear(torch.cat([h_t, ctx_t], 1)))
-            read_out = self.dropout(read_out)
+            att_t = F.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t], 1)))  # E.q. (5)
+            att_t = self.dropout(att_t)
 
-            score_t = self.readout(read_out)
+            score_t = self.readout(att_t)  # E.q. (6)
             p_t = F.softmax(score_t)
 
             y_t = torch.multinomial(p_t, num_samples=1).squeeze(1)
@@ -378,7 +363,7 @@ class NMT(nn.Module):
             if torch.equal(y_t.data, eos_batch):
                 break
 
-            ctx_tm1 = ctx_t
+            att_tm1 = att_t
             hidden = h_t, cell_t
 
         # post-processing
@@ -389,7 +374,7 @@ class NMT(nn.Module):
                     completed_samples[i].append(sampled_word)
 
         if to_word:
-            completed_samples = word2id(completed_samples, self.tgt_vocab_id2word)
+            completed_samples = word2id(completed_samples, self.vocab.tgt.id2word)
 
         return completed_samples
 
@@ -679,34 +664,33 @@ def test(args):
 
 
 def sample(args):
-    train_data_src = read_corpus(args.train_src)
-    train_data_tgt = read_corpus(args.train_tgt)
-
-    src_vocab = build_vocab(train_data_src, args.src_vocab_size)
-    tgt_vocab = build_vocab(train_data_tgt, args.tgt_vocab_size)
-
-    src_vocab_id2word = build_id2word_vocab(src_vocab)
-    tgt_vocab_id2word = build_id2word_vocab(tgt_vocab)
-
-    model = NMT(args, src_vocab, tgt_vocab, src_vocab_id2word, tgt_vocab_id2word)
-    model.eval()
+    train_data_src = read_corpus(args.train_src, source='src')
+    train_data_tgt = read_corpus(args.train_tgt, source='tgt')
+    train_data = zip(train_data_src, train_data_tgt)
 
     if args.load_model:
         print('load model from [%s]' % args.load_model, file=sys.stderr)
-        model.load_state_dict(torch.load(args.load_model, map_location=lambda storage, loc: storage))
-    if args.cuda:
-        model = model.cuda()
+        params = torch.load(args.load_model, map_location=lambda storage, loc: storage)
+        vocab = params['vocab']
+        args = params['args']
+        state_dict = params['state_dict']
 
-    train_data = zip(train_data_src, train_data_tgt)
+        model = NMT(args, vocab)
+        model.load_state_dict(state_dict)
+    else:
+        vocab = torch.load(args.vocab)
+        model = NMT(args, vocab)
+
+    model.eval()
+
     print('begin sampling')
 
     check_every = 10
     train_iter = cum_samples = 0
     train_time = time.time()
-    for src_sents, tgt_sents in islice(data_iter(train_data, batch_size=args.batch_size), 500):
+    for src_sents, tgt_sents in data_iter(train_data, batch_size=args.batch_size):
         train_iter += 1
-        src_word_ids = word2id(src_sents, src_vocab)
-        samples = model.sample(src_word_ids, sample_size=args.sample_size, to_word=True)
+        samples = model.sample(src_sents, sample_size=args.sample_size, to_word=True)
         cum_samples += len(samples)
         print('%d samples' % len(samples))
 
@@ -716,12 +700,12 @@ def sample(args):
             cum_samples = 0
             train_time = time.time()
 
-        # print('*' * 80)
-        # print('target:' + ' '.join(tgt_sents[0]))
-        # print('samples:')
-        # for i, sample in enumerate(samples, 1):
-        #     print('[%d] %s' % (i, ' '.join(sample[1:-1])))
-        # print('*' * 80)
+        print('*' * 80)
+        print('target:' + ' '.join(tgt_sents[0]))
+        print('samples:')
+        for i, sample in enumerate(samples, 1):
+            print('[%d] %s' % (i, ' '.join(sample[1:-1])))
+        print('*' * 80)
 
 
 if __name__ == '__main__':
