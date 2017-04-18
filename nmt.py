@@ -303,7 +303,8 @@ class NMT(nn.Module):
         if not sample_size:
             sample_size = args.sample_size
 
-        batch_size = len(src_sents) * sample_size
+        src_sents_num = len(src_sents)
+        batch_size = src_sents_num * sample_size
         src_sents_var = to_input_variable(src_sents, self.vocab.src, cuda=args.cuda, is_test=True)
         src_encoding, (dec_init_state, dec_init_cell) = self.encode(src_sents_var, [len(s) for s in src_sents])
 
@@ -367,14 +368,17 @@ class NMT(nn.Module):
             hidden = h_t, cell_t
 
         # post-processing
-        completed_samples = [list() for _ in xrange(batch_size)]
+        completed_samples = [list([list() for _ in xrange(sample_size)]) for _ in xrange(src_sents_num)]
         for y_t in samples:
             for i, sampled_word in enumerate(y_t.cpu().data):
-                if len(completed_samples[i]) == 0 or completed_samples[i][-1] != eos:
-                    completed_samples[i].append(sampled_word)
+                src_sent_id = i % src_sents_num
+                sample_id = i / src_sents_num
+                if len(completed_samples[src_sent_id][sample_id]) == 0 or completed_samples[src_sent_id][sample_id][-1] != eos:
+                    completed_samples[src_sent_id][sample_id].append(sampled_word)
 
         if to_word:
-            completed_samples = word2id(completed_samples, self.vocab.tgt.id2word)
+            for i, src_sent_samples in enumerate(completed_samples):
+                completed_samples[i] = word2id(src_sent_samples, self.vocab.tgt.id2word)
 
         return completed_samples
 
@@ -672,10 +676,10 @@ def sample(args):
         print('load model from [%s]' % args.load_model, file=sys.stderr)
         params = torch.load(args.load_model, map_location=lambda storage, loc: storage)
         vocab = params['vocab']
-        args = params['args']
+        opt = params['args']
         state_dict = params['state_dict']
 
-        model = NMT(args, vocab)
+        model = NMT(opt, vocab)
         model.load_state_dict(state_dict)
     else:
         vocab = torch.load(args.vocab)
@@ -694,21 +698,22 @@ def sample(args):
     for src_sents, tgt_sents in data_iter(train_data, batch_size=args.batch_size):
         train_iter += 1
         samples = model.sample(src_sents, sample_size=args.sample_size, to_word=True)
-        cum_samples += len(samples)
-        print('%d samples' % len(samples))
+        cum_samples += sum(len(sample) for sample in samples)
 
         if train_iter % check_every == 0:
             elapsed = time.time() - train_time
-            print('sampling speed: %d/s' % (cum_samples / elapsed))
+            print('sampling speed: %d/s' % (cum_samples / elapsed), file=sys.stderr)
             cum_samples = 0
             train_time = time.time()
 
-        print('*' * 80)
-        print('target:' + ' '.join(tgt_sents[0]))
-        print('samples:')
-        for i, sample in enumerate(samples, 1):
-            print('[%d] %s' % (i, ' '.join(sample[1:-1])))
-        print('*' * 80)
+        for i, tgt_sent in enumerate(tgt_sents):
+            print('*' * 80)
+            print('target:' + ' '.join(tgt_sent))
+            tgt_samples = samples[i]
+            print('samples:')
+            for sid, sample in enumerate(tgt_samples, 1):
+                print('[%d] %s' % (sid, ' '.join(sample[1:-1])))
+            print('*' * 80)
 
 
 if __name__ == '__main__':
