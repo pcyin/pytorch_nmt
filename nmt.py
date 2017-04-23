@@ -1,5 +1,7 @@
 from __future__ import print_function
 
+import re
+
 import torch
 import torch.nn as nn
 import torch.nn.utils
@@ -22,40 +24,46 @@ from vocab import Vocab, VocabEntry
 
 def init_config():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--seed', default=5783287, type=int)
-    parser.add_argument('--cuda', action='store_true', default=False)
-    parser.add_argument('--mode', choices=['train', 'test', 'sample'], default='train')
-    parser.add_argument('--vocab', type=str)
-    parser.add_argument('--batch_size', default=32, type=int)
-    parser.add_argument('--beam_size', default=5, type=int)
-    parser.add_argument('--sample_size', default=10, type=int)
-    parser.add_argument('--embed_size', default=256, type=int)
-    parser.add_argument('--hidden_size', default=256, type=int)
-    parser.add_argument('--dropout', default=0., type=float)
+    parser.add_argument('--seed', default=5783287, type=int, help='random seed')
+    parser.add_argument('--cuda', action='store_true', default=False, help='use gpu')
+    parser.add_argument('--mode', choices=['train', 'raml_train', 'test', 'sample'], default='train', help='run mode')
+    parser.add_argument('--vocab', type=str, help='path of the serialized vocabulary')
+    parser.add_argument('--batch_size', default=32, type=int, help='batch size')
+    parser.add_argument('--beam_size', default=5, type=int, help='beam size for beam search')
+    parser.add_argument('--sample_size', default=10, type=int, help='sample size')
+    parser.add_argument('--embed_size', default=256, type=int, help='size of word embeddings')
+    parser.add_argument('--hidden_size', default=256, type=int, help='size of LSTM hidden states')
+    parser.add_argument('--dropout', default=0., type=float, help='dropout rate')
 
-    parser.add_argument('--train_src', type=str)
-    parser.add_argument('--train_tgt', type=str)
-    parser.add_argument('--dev_src', type=str)
-    parser.add_argument('--dev_tgt', type=str)
-    parser.add_argument('--test_src', type=str)
-    parser.add_argument('--test_tgt', type=str)
+    parser.add_argument('--train_src', type=str, help='path to the training source file')
+    parser.add_argument('--train_tgt', type=str, help='path to the training target file')
+    parser.add_argument('--dev_src', type=str, help='path to the dev source file')
+    parser.add_argument('--dev_tgt', type=str, help='path to the dev target file')
+    parser.add_argument('--test_src', type=str, help='path to the test source file')
+    parser.add_argument('--test_tgt', type=str, help='path to the test target file')
 
-    parser.add_argument('--decode_max_time_step', default=200, type=int)
+    parser.add_argument('--decode_max_time_step', default=200, type=int, help='maximum number of time steps used '
+                                                                              'in decoding and sampling')
 
-    parser.add_argument('--valid_niter', default=500, type=int)
-    parser.add_argument('--valid_metric', default='bleu', choices=['bleu', 'ppl'])
-    parser.add_argument('--log_every', default=50, type=int)
-    parser.add_argument('--load_model', default=None, type=str)
-    parser.add_argument('--save_to', default='model', type=str)
-    parser.add_argument('--save_model_after', default=2)
-    parser.add_argument('--save_to_file', default=None, type=str)
-    parser.add_argument('--patience', default=5, type=int)
-    parser.add_argument('--uniform_init', default=None, type=float)
-    parser.add_argument('--clip_grad', default=5., type=float)
-    parser.add_argument('--max_niter', default=-1, type=int)
-    parser.add_argument('--lr_decay', default=0.5, type=float)
+    parser.add_argument('--valid_niter', default=500, type=int, help='every n iterations to perform validation')
+    parser.add_argument('--valid_metric', default='bleu', choices=['bleu', 'ppl', 'word_acc', 'sent_acc'], help='metric used for validation')
+    parser.add_argument('--log_every', default=50, type=int, help='every n iterations to log training statistics')
+    parser.add_argument('--load_model', default=None, type=str, help='load a pre-trained model')
+    parser.add_argument('--save_to', default='model', type=str, help='save trained model to')
+    parser.add_argument('--save_model_after', default=2, help='save the model only after n validation iterations')
+    parser.add_argument('--save_to_file', default=None, type=str, help='if provided, save decoding results to file')
+    parser.add_argument('--patience', default=5, type=int, help='training patience')
+    parser.add_argument('--uniform_init', default=None, type=float, help='if specified, use uniform initialization for all parameters')
+    parser.add_argument('--clip_grad', default=5., type=float, help='clip gradients')
+    parser.add_argument('--max_niter', default=-1, type=int, help='maximum number of training iterations')
+    parser.add_argument('--lr_decay', default=0.5, type=float, help='decay learning rate if the validation performance drops')
 
-    parser.add_argument('--sample_method', default='expand')
+    # raml training
+    parser.add_argument('--temp', default=0.85, type=float, help='temperature in reward distribution')
+    parser.add_argument('--raml_sample_file', type=str, help='path to the sampled targets')
+
+    #TODO: greedy sampling is still buggy!
+    parser.add_argument('--sample_method', default='random', choices=['random', 'greedy'])
 
     args = parser.parse_args()
 
@@ -309,16 +317,17 @@ class NMT(nn.Module):
         src_encoding, (dec_init_state, dec_init_cell) = self.encode(src_sents_var, [len(s) for s in src_sents])
 
         # tile everything
-        if args.sample_method == 'expand':
-            # src_enc: (src_sent_len, sample_size, enc_size)
-            # cat result: (src_sent_len, batch_size * sample_size, enc_size)
-            src_encoding = torch.cat([src_enc.expand(src_enc.size(0), sample_size, src_enc.size(2)) for src_enc in src_encoding.split(1, dim=1)], 1)
-            dec_init_state = torch.cat([x.expand(sample_size, x.size(1)) for x in dec_init_state.split(1, dim=0)], 0)
-            dec_init_cell = torch.cat([x.expand(sample_size, x.size(1)) for x in dec_init_cell.split(1, dim=0)], 0)
-        elif args.sample_method == 'repeat':
-            src_encoding = src_encoding.repeat(1, sample_size, 1)
-            dec_init_state = dec_init_state.repeat(sample_size, 1)
-            dec_init_cell = dec_init_cell.repeat(sample_size, 1)
+        # if args.sample_method == 'expand':
+        #     # src_enc: (src_sent_len, sample_size, enc_size)
+        #     # cat result: (src_sent_len, batch_size * sample_size, enc_size)
+        #     src_encoding = torch.cat([src_enc.expand(src_enc.size(0), sample_size, src_enc.size(2)) for src_enc in src_encoding.split(1, dim=1)], 1)
+        #     dec_init_state = torch.cat([x.expand(sample_size, x.size(1)) for x in dec_init_state.split(1, dim=0)], 0)
+        #     dec_init_cell = torch.cat([x.expand(sample_size, x.size(1)) for x in dec_init_cell.split(1, dim=0)], 0)
+        # elif args.sample_method == 'repeat':
+
+        src_encoding = src_encoding.repeat(1, sample_size, 1)
+        dec_init_state = dec_init_state.repeat(sample_size, 1)
+        dec_init_cell = dec_init_cell.repeat(sample_size, 1)
 
         src_encoding = src_encoding.t()
         hidden = (dec_init_state, dec_init_cell)
@@ -358,7 +367,12 @@ class NMT(nn.Module):
             score_t = self.readout(att_t)  # E.q. (6)
             p_t = F.softmax(score_t)
 
-            y_t = torch.multinomial(p_t, num_samples=1).squeeze(1)
+            if args.sample_method == 'random':
+                y_t = torch.multinomial(p_t, num_samples=1).squeeze(1)
+            elif args.sample_method == 'greedy':
+                _, y_t = torch.topk(p_t, k=1, dim=1)
+                y_t = y_t.squeeze(1)
+
             samples.append(y_t)
 
             if torch.equal(y_t.data, eos_batch):
@@ -463,16 +477,7 @@ def evaluate_loss(model, data, crit):
     return loss
 
 
-def train(args):
-    train_data_src = read_corpus(args.train_src, source='src')
-    train_data_tgt = read_corpus(args.train_tgt, source='tgt')
-
-    dev_data_src = read_corpus(args.dev_src, source='src')
-    dev_data_tgt = read_corpus(args.dev_tgt, source='tgt')
-
-    train_data = zip(train_data_src, train_data_tgt)
-    dev_data = zip(dev_data_src, dev_data_tgt)
-
+def init_training(args):
     vocab = torch.load(args.vocab)
 
     model = NMT(args, vocab)
@@ -485,15 +490,33 @@ def train(args):
 
     vocab_mask = torch.ones(len(vocab.tgt))
     vocab_mask[vocab.tgt['<pad>']] = 0
+    nll_loss = nn.NLLLoss(weight=vocab_mask, size_average=False)
     cross_entropy_loss = nn.CrossEntropyLoss(weight=vocab_mask, size_average=False)
 
     if args.cuda:
         model = model.cuda()
+        nll_loss = nll_loss.cuda()
         cross_entropy_loss = cross_entropy_loss.cuda()
 
     optimizer = torch.optim.Adam(model.parameters())
 
-    train_iter = patience = cum_loss = report_loss = cum_tgt_words = report_tgt_words = cum_examples = cum_batches = report_examples = epoch = valid_num = best_model_iter = 0
+    return vocab, model, optimizer, nll_loss, cross_entropy_loss
+
+
+def train(args):
+    train_data_src = read_corpus(args.train_src, source='src')
+    train_data_tgt = read_corpus(args.train_tgt, source='tgt')
+
+    dev_data_src = read_corpus(args.dev_src, source='src')
+    dev_data_tgt = read_corpus(args.dev_tgt, source='tgt')
+
+    train_data = zip(train_data_src, train_data_tgt)
+    dev_data = zip(dev_data_src, dev_data_tgt)
+
+    vocab, model, optimizer, nll_loss, cross_entropy_loss = init_training(args)
+
+    train_iter = patience = cum_loss = report_loss = cum_tgt_words = report_tgt_words = 0
+    cum_examples = cum_batches = report_examples = epoch = valid_num = best_model_iter = 0
     hist_valid_scores = []
     train_time = begin_time = time.time()
     print('begin Maximum Likelihood training')
@@ -563,9 +586,13 @@ def train(args):
                 dev_loss = evaluate_loss(model, dev_data, cross_entropy_loss)
                 dev_ppl = np.exp(dev_loss)
 
-                if args.valid_metric == 'bleu':
-                    dev_hyps, valid_metric = decode(model, dev_data)
-                    print('validation: iter %d, dev. ppl %f, dev. bleu %f' % (train_iter, dev_ppl, valid_metric),
+                if args.valid_metric in ['bleu', 'word_acc', 'sent_acc']:
+                    dev_hyps = decode(model, dev_data)
+                    if args.valid_metric == 'bleu':
+                        valid_metric = get_bleu([tgt for src, tgt in dev_data], dev_hyps)
+                    else:
+                        valid_metric = get_acc([tgt for src, tgt in dev_data], dev_hyps, acc_type=args.valid_metric)
+                    print('validation: iter %d, dev. ppl %f, dev. %s %f' % (train_iter, dev_ppl, args.valid_metric, valid_metric),
                           file=sys.stderr)
                 else:
                     valid_metric = -dev_ppl
@@ -606,6 +633,207 @@ def train(args):
                         exit(0)
 
 
+def read_raml_train_data(data_file, temp):
+    train_data = dict()
+    num_pattern = re.compile('^(\d+) samples$')
+    with open(data_file) as f:
+        while True:
+            line = f.readline()
+            if line is None or line == '':
+                break
+
+            assert line.startswith('***')
+
+            src_sent = f.readline()[len('source: '):].strip()
+            tgt_num = int(num_pattern.match(f.readline().strip()).group(1))
+            tgt_samples = []
+            tgt_scores = []
+            for i in xrange(tgt_num):
+                d = f.readline().strip().split(' ||| ')
+                if len(d) < 2:
+                    continue
+
+                tgt_sent = d[0].strip()
+                bleu_score = float(d[1])
+                tgt_samples.append(tgt_sent)
+                tgt_scores.append(bleu_score / temp)
+
+            tgt_scores = np.exp(tgt_scores)
+            tgt_scores = tgt_scores / np.sum(tgt_scores)
+
+            tgt_entry = zip(tgt_samples, tgt_scores)
+            train_data[src_sent] = tgt_entry
+
+            line = f.readline()
+
+    return train_data
+
+def train_raml(args):
+    vocab = torch.load(args.vocab)
+
+    train_data_src = read_corpus(args.train_src, source='src')
+    train_data_tgt = read_corpus(args.train_tgt, source='tgt')
+    train_data = zip(train_data_src, train_data_tgt)
+
+    dev_data_src = read_corpus(args.dev_src, source='src')
+    dev_data_tgt = read_corpus(args.dev_tgt, source='tgt')
+    dev_data = zip(dev_data_src, dev_data_tgt)
+
+    # dict of (src, [tgt: (sent, prob)])
+    print('read in raml training data...', file=sys.stderr, end='')
+    begin_time = time.time()
+    raml_samples = read_raml_train_data(args.raml_sample_file, temp=args.temp)
+    print('done[%d s].' % (time.time() - begin_time))
+
+    vocab, model, optimizer, nll_loss, cross_entropy_loss = init_training(args)
+
+    train_iter = patience = cum_loss = report_loss = cum_tgt_words = report_tgt_words = 0
+    report_weighted_loss = cum_weighted_loss = 0
+    cum_examples = cum_batches = report_examples = epoch = valid_num = best_model_iter = 0
+    hist_valid_scores = []
+    train_time = begin_time = time.time()
+    print('begin RAML training')
+
+    while True:
+        epoch += 1
+        for src_sents, tgt_sents in data_iter(train_data, batch_size=args.batch_size):
+            train_iter += 1
+
+            raml_src_sents = []
+            raml_tgt_sents = []
+            raml_tgt_weights = []
+            for src_sent in src_sents:
+                tgt_samples_all = raml_samples[' '.join(src_sent)]
+
+                if args.sample_size >= len(tgt_samples_all):
+                    tgt_samples = tgt_samples_all
+                else:
+                    tgt_samples_id = np.random.choice(range(1, len(tgt_samples_all)), size=args.sample_size - 1, replace=False)
+                    tgt_samples = [tgt_samples_all[0]] + [tgt_samples_all[i] for i in tgt_samples_id] # make sure the ground truth y* is in the samples
+
+                raml_src_sents.extend([src_sent] * len(tgt_samples))
+                raml_tgt_sents.extend([['<s>'] + sent.split(' ') + ['</s>'] for sent, weight in tgt_samples])
+                raml_tgt_weights.extend([weight for sent, weight in tgt_samples])
+
+            src_sents_var = to_input_variable(raml_src_sents, vocab.src, cuda=args.cuda)
+            tgt_sents_var = to_input_variable(raml_tgt_sents, vocab.tgt, cuda=args.cuda)
+            weights_var = Variable(torch.FloatTensor(raml_tgt_weights), requires_grad=False)
+            if args.cuda:
+                weights_var = weights_var.cuda()
+
+            batch_size = len(raml_src_sents)  # batch_size = args.batch_size * args.sample_size
+            src_sents_len = [len(s) for s in raml_src_sents]
+            pred_tgt_word_num = sum(len(s[1:]) for s in raml_tgt_sents)  # omitting leading `<s>`
+            optimizer.zero_grad()
+
+            # (tgt_sent_len, batch_size, tgt_vocab_size)
+            scores = model(src_sents_var, src_sents_len, tgt_sents_var[:-1])
+            log_scores = F.log_softmax(scores.view(-1, scores.size(2)))
+            weights = weights_var.view(1, weights_var.size(0), 1).expand_as(scores).contiguous()
+            weighted_nll_scores = log_scores * weights.view(-1, scores.size(2))
+
+            flattened_tgt_sents = tgt_sents_var[1:].view(-1)
+            weighted_loss = nll_loss(weighted_nll_scores, flattened_tgt_sents)
+            loss = weighted_loss / batch_size
+            nll_loss_val = nll_loss(log_scores, flattened_tgt_sents).data[0]
+
+            loss.backward()
+            # clip gradient
+            grad_norm = torch.nn.utils.clip_grad_norm(model.parameters(), args.clip_grad)
+            optimizer.step()
+
+            report_weighted_loss += weighted_loss.data[0]
+            cum_weighted_loss += weighted_loss.data[0]
+            report_loss += nll_loss_val
+            cum_loss += nll_loss_val
+            report_tgt_words += pred_tgt_word_num
+            cum_tgt_words += pred_tgt_word_num
+            report_examples += batch_size
+            cum_examples += batch_size
+            cum_batches += batch_size
+
+            if train_iter % args.log_every == 0:
+                print('epoch %d, iter %d, avg. loss %.2f, '
+                      'avg. ppl %.2f cum. examples %d, '
+                      'speed %.2f words/sec, time elapsed %.2f sec' % (epoch, train_iter,
+                                                                       report_weighted_loss / report_examples,
+                                                                       np.exp(report_loss / report_tgt_words),
+                                                                       cum_examples,
+                                                                       report_tgt_words / (time.time() - train_time),
+                                                                       time.time() - begin_time),
+                      file=sys.stderr)
+
+                train_time = time.time()
+                report_loss = report_weighted_loss = report_tgt_words = report_examples = 0.
+
+                # perform validation
+                if train_iter % args.valid_niter == 0:
+                    print('epoch %d, iter %d, cum. loss %.2f, '
+                          'cum. ppl %.2f cum. examples %d' % (epoch, train_iter,
+                                                              cum_weighted_loss / cum_batches,
+                                                              np.exp(cum_loss / cum_tgt_words),
+                                                              cum_examples),
+                          file=sys.stderr)
+
+                    cum_loss = cum_weighted_loss = cum_batches = cum_tgt_words = 0.
+                    valid_num += 1
+
+                    print('begin validation ...', file=sys.stderr)
+                    model.eval()
+
+                    # compute dev. ppl and bleu
+
+                    dev_loss = evaluate_loss(model, dev_data, cross_entropy_loss)
+                    dev_ppl = np.exp(dev_loss)
+
+                    if args.valid_metric in ['bleu', 'word_acc', 'sent_acc']:
+                        dev_hyps = decode(model, dev_data)
+                        if args.valid_metric == 'bleu':
+                            valid_metric = get_bleu([tgt for src, tgt in dev_data], dev_hyps)
+                        else:
+                            valid_metric = get_acc([tgt for src, tgt in dev_data], dev_hyps, acc_type=args.valid_metric)
+                        print('validation: iter %d, dev. ppl %f, dev. %s %f' % (
+                        train_iter, dev_ppl, args.valid_metric, valid_metric),
+                              file=sys.stderr)
+                    else:
+                        valid_metric = -dev_ppl
+                        print('validation: iter %d, dev. ppl %f' % (train_iter, dev_ppl),
+                              file=sys.stderr)
+
+                    model.train()
+
+                    is_better = len(hist_valid_scores) == 0 or valid_metric > max(hist_valid_scores)
+                    is_better_than_last = len(hist_valid_scores) == 0 or valid_metric > hist_valid_scores[-1]
+                    hist_valid_scores.append(valid_metric)
+
+                    if valid_num > args.save_model_after:
+                        model_file = args.save_to + '.iter%d.bin' % train_iter
+                        print('save model to [%s]' % model_file, file=sys.stderr)
+                        model.save(model_file)
+
+                    if (not is_better_than_last) and args.lr_decay:
+                        lr = optimizer.param_groups[0]['lr'] * args.lr_decay
+                        print('decay learning rate to %f' % lr, file=sys.stderr)
+                        optimizer.param_groups[0]['lr'] = lr
+
+                    if is_better:
+                        patience = 0
+                        best_model_iter = train_iter
+
+                        if valid_num > args.save_model_after:
+                            print('save currently the best model ..', file=sys.stderr)
+                            model_file_abs_path = os.path.abspath(model_file)
+                            symlin_file_abs_path = os.path.abspath(args.save_to + '.bin')
+                            os.system('ln -sf %s %s' % (model_file_abs_path, symlin_file_abs_path))
+                    else:
+                        patience += 1
+                        print('hit patience %d' % patience, file=sys.stderr)
+                        if patience == args.patience:
+                            print('early stop!', file=sys.stderr)
+                            print('the best model is from iteration [%d]' % best_model_iter, file=sys.stderr)
+                            exit(0)
+
+
 def get_bleu(references, hypotheses):
     # compute BLEU
     bleu_score = corpus_bleu([[ref[1:-1]] for ref in references],
@@ -614,19 +842,51 @@ def get_bleu(references, hypotheses):
     return bleu_score
 
 
-def decode(model, data):
+def get_acc(references, hypotheses, acc_type='word'):
+    assert acc_type == 'word_acc' or acc_type == 'sent_acc'
+    cum_acc = 0.
+
+    for ref, hyp in zip(references, hypotheses):
+        ref = ref[1:-1]
+        hyp = hyp[1:-1]
+        if acc_type == 'word_acc':
+            acc = len([1 for ref_w, hyp_w in zip(ref, hyp) if ref_w == hyp_w]) / float(len(hyp))
+        else:
+            acc = 1. if all(ref_w == hyp_w for ref_w, hyp_w in zip(ref, hyp)) else 0.
+        cum_acc += acc
+
+    acc = cum_acc / len(hypotheses)
+    return acc
+
+
+def decode(model, data, verbose=True):
+    """
+    decode the dataset and compute sentence level acc. and BLEU.
+    """
     hypotheses = []
     begin_time = time.time()
-    for src_sent, tgt_sent in data:
-        hyp = model.translate(src_sent)[0]
-        hypotheses.append(hyp)
-        print('*' * 50)
-        print('Source: ', ' '.join(src_sent))
-        print('Target: ', ' '.join(tgt_sent))
-        print('Hypothesis: ', ' '.join(hyp))
+
+    if type(data[0]) is tuple:
+        for src_sent, tgt_sent in data:
+            hyp = model.translate(src_sent)[0]
+            hypotheses.append(hyp)
+
+            if verbose:
+                print('*' * 50)
+                print('Source: ', ' '.join(src_sent))
+                print('Target: ', ' '.join(tgt_sent))
+                print('Hypothesis: ', ' '.join(hyp))
+    else:
+        for src_sent in data:
+            hyp = model.translate(src_sent)[0]
+            hypotheses.append(hyp)
+
+            if verbose:
+                print('*' * 50)
+                print('Source: ', ' '.join(src_sent))
+                print('Hypothesis: ', ' '.join(hyp))
 
     elapsed = time.time() - begin_time
-    bleu_score = get_bleu([tgt for src, tgt in data], hypotheses)
 
     print('decoded %d examples, took %d s' % (len(data), elapsed), file=sys.stderr)
     if args.save_to_file:
@@ -635,7 +895,7 @@ def decode(model, data):
             for hyp in hypotheses:
                 f.write(' '.join(hyp[1:-1]) + '\n')
 
-    return hypotheses, bleu_score
+    return hypotheses
 
 
 def test(args):
@@ -661,10 +921,13 @@ def test(args):
     if args.cuda:
         model = model.cuda()
 
-    hypotheses, bleu_score = decode(model, test_data)
+    hypotheses = decode(model, test_data)
 
     bleu_score = get_bleu([tgt for src, tgt in test_data], hypotheses)
-    print('Corpus Level BLEU: %f' % bleu_score, file=sys.stderr)
+    word_acc = get_acc([tgt for src, tgt in test_data], hypotheses, 'word_acc')
+    sent_acc = get_acc([tgt for src, tgt in test_data], hypotheses, 'sent_acc')
+    print('Corpus Level BLEU: %f, word level acc: %f, sentence level acc: %f' % (bleu_score, word_acc, sent_acc),
+          file=sys.stderr)
 
 
 def sample(args):
@@ -722,7 +985,11 @@ if __name__ == '__main__':
 
     if args.mode == 'train':
         train(args)
+    elif args.mode == 'raml_train':
+        train_raml(args)
     elif args.mode == 'sample':
         sample(args)
     elif args.mode == 'test':
         test(args)
+    else:
+        raise RuntimeError('unknown mode')
