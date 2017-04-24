@@ -730,21 +730,29 @@ def train_raml(args):
             # (tgt_sent_len, batch_size, tgt_vocab_size)
             scores = model(src_sents_var, src_sents_len, tgt_sents_var[:-1])
             log_scores = F.log_softmax(scores.view(-1, scores.size(2)))
-            weights = weights_var.view(1, weights_var.size(0), 1).expand_as(scores).contiguous()
-            weighted_nll_scores = log_scores * weights.view(-1, scores.size(2))
-
+            # weights = weights_var.view(1, weights_var.size(0), 1).expand_as(scores).contiguous()
             flattened_tgt_sents = tgt_sents_var[1:].view(-1)
-            weighted_loss = nll_loss(weighted_nll_scores, flattened_tgt_sents)
+
+            # batch_size * tgt_sent_len
+            tgt_log_scores = torch.gather(log_scores, 1, flattened_tgt_sents.unsqueeze(1)).squeeze(1)
+            unweighted_loss = -tgt_log_scores * (1. - torch.eq(flattened_tgt_sents, 0).float())
+            weighted_loss = unweighted_loss * weights_var.repeat(scores.size(0))
+            weighted_loss = weighted_loss.sum()
+            weighted_loss_val = weighted_loss.data[0]
+            nll_loss_val = unweighted_loss.sum().data[0]
+            # weighted_log_scores = log_scores * weights.view(-1, scores.size(2))
+            # weighted_loss = nll_loss(weighted_log_scores, flattened_tgt_sents)
+
             loss = weighted_loss / batch_size
-            nll_loss_val = nll_loss(log_scores, flattened_tgt_sents).data[0]
+            # nll_loss_val = nll_loss(log_scores, flattened_tgt_sents).data[0]
 
             loss.backward()
             # clip gradient
             grad_norm = torch.nn.utils.clip_grad_norm(model.parameters(), args.clip_grad)
             optimizer.step()
 
-            report_weighted_loss += weighted_loss.data[0]
-            cum_weighted_loss += weighted_loss.data[0]
+            report_weighted_loss += weighted_loss_val
+            cum_weighted_loss += weighted_loss_val
             report_loss += nll_loss_val
             cum_loss += nll_loss_val
             report_tgt_words += pred_tgt_word_num
