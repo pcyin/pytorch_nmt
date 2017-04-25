@@ -109,7 +109,7 @@ def sample_ngram(args):
         # append itself
         tgt_samples.append(tgt_sent)
 
-        for sid in xrange(99):
+        for sid in xrange(args.sample_size - 1):
             n = np.random.randint(1, min(tgt_len, 5)) # we do not replace the last token: it must be a period!
 
             idx = np.random.randint(tgt_len - n)
@@ -150,6 +150,7 @@ if __name__ == '__main__':
     parser.add_argument('--parallel_data', type=str)
     parser.add_argument('--sample_file', type=str)
     parser.add_argument('--output', type=str, required=True)
+    parser.add_argument('--sample_size', type=int, default=100)
 
     args = parser.parse_args()
 
