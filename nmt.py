@@ -52,6 +52,7 @@ def init_config():
     parser.add_argument('--save_to', default='model', type=str, help='save trained model to')
     parser.add_argument('--save_model_after', default=2, help='save the model only after n validation iterations')
     parser.add_argument('--save_to_file', default=None, type=str, help='if provided, save decoding results to file')
+    parser.add_argument('--save_nbest', default=False, action='store_true', help='save nbest decoding results')
     parser.add_argument('--patience', default=5, type=int, help='training patience')
     parser.add_argument('--uniform_init', default=None, type=float, help='if specified, use uniform initialization for all parameters')
     parser.add_argument('--clip_grad', default=5., type=float, help='clip gradients')
@@ -589,6 +590,7 @@ def train(args):
 
                 if args.valid_metric in ['bleu', 'word_acc', 'sent_acc']:
                     dev_hyps = decode(model, dev_data)
+                    dev_hyps = [hyps[0] for hyps in dev_hyps]
                     if args.valid_metric == 'bleu':
                         valid_metric = get_bleu([tgt for src, tgt in dev_data], dev_hyps)
                     else:
@@ -797,6 +799,7 @@ def train_raml(args):
 
                 if args.valid_metric in ['bleu', 'word_acc', 'sent_acc']:
                     dev_hyps = decode(model, dev_data)
+                    dev_hyps = [hyps[0] for hyps in dev_hyps]
                     if args.valid_metric == 'bleu':
                         valid_metric = get_bleu([tgt for src, tgt in dev_data], dev_hyps)
                     else:
@@ -859,7 +862,7 @@ def get_acc(references, hypotheses, acc_type='word'):
         ref = ref[1:-1]
         hyp = hyp[1:-1]
         if acc_type == 'word_acc':
-            acc = len([1 for ref_w, hyp_w in zip(ref, hyp) if ref_w == hyp_w]) / float(len(hyp))
+            acc = len([1 for ref_w, hyp_w in zip(ref, hyp) if ref_w == hyp_w]) / float(len(hyp) + 1e-6)
         else:
             acc = 1. if all(ref_w == hyp_w for ref_w, hyp_w in zip(ref, hyp)) else 0.
         cum_acc += acc
@@ -877,32 +880,27 @@ def decode(model, data, verbose=True):
 
     if type(data[0]) is tuple:
         for src_sent, tgt_sent in data:
-            hyp = model.translate(src_sent)[0]
-            hypotheses.append(hyp)
+            hyps = model.translate(src_sent)
+            hypotheses.append(hyps)
 
             if verbose:
                 print('*' * 50)
                 print('Source: ', ' '.join(src_sent))
                 print('Target: ', ' '.join(tgt_sent))
-                print('Hypothesis: ', ' '.join(hyp))
+                print('Top Hypothesis: ', ' '.join(hyps[0]))
     else:
         for src_sent in data:
-            hyp = model.translate(src_sent)[0]
-            hypotheses.append(hyp)
+            hyps = model.translate(src_sent)
+            hypotheses.append(hyps)
 
             if verbose:
                 print('*' * 50)
                 print('Source: ', ' '.join(src_sent))
-                print('Hypothesis: ', ' '.join(hyp))
+                print('Top Hypothesis: ', ' '.join(hyps[0]))
 
     elapsed = time.time() - begin_time
 
     print('decoded %d examples, took %d s' % (len(data), elapsed), file=sys.stderr)
-    if args.save_to_file:
-        print('save decoding results to %s' % args.save_to_file, file=sys.stderr)
-        with open(args.save_to_file, 'w') as f:
-            for hyp in hypotheses:
-                f.write(' '.join(hyp[1:-1]) + '\n')
 
     return hypotheses
 
@@ -916,10 +914,10 @@ def test(args):
         print('load model from [%s]' % args.load_model, file=sys.stderr)
         params = torch.load(args.load_model, map_location=lambda storage, loc: storage)
         vocab = params['vocab']
-        args = params['args']
+        saved_args = params['args']
         state_dict = params['state_dict']
 
-        model = NMT(args, vocab)
+        model = NMT(saved_args, vocab)
         model.load_state_dict(state_dict)
     else:
         vocab = torch.load(args.vocab)
@@ -931,12 +929,31 @@ def test(args):
         model = model.cuda()
 
     hypotheses = decode(model, test_data)
+    top_hypotheses = [hyps[0] for hyps in hypotheses]
 
-    bleu_score = get_bleu([tgt for src, tgt in test_data], hypotheses)
-    word_acc = get_acc([tgt for src, tgt in test_data], hypotheses, 'word_acc')
-    sent_acc = get_acc([tgt for src, tgt in test_data], hypotheses, 'sent_acc')
+    bleu_score = get_bleu([tgt for src, tgt in test_data], top_hypotheses)
+    word_acc = get_acc([tgt for src, tgt in test_data], top_hypotheses, 'word_acc')
+    sent_acc = get_acc([tgt for src, tgt in test_data], top_hypotheses, 'sent_acc')
     print('Corpus Level BLEU: %f, word level acc: %f, sentence level acc: %f' % (bleu_score, word_acc, sent_acc),
           file=sys.stderr)
+
+    if args.save_to_file:
+        print('save decoding results to %s' % args.save_to_file, file=sys.stderr)
+        with open(args.save_to_file, 'w') as f:
+            for hyps in hypotheses:
+                f.write(' '.join(hyps[0][1:-1]) + '\n')
+
+        if args.save_nbest:
+            nbest_file = args.save_to_file + '.nbest'
+            print('save nbest decoding results to %s' % nbest_file, file=sys.stderr)
+            with open(nbest_file, 'w') as f:
+                for src_sent, tgt_sent, hyps in zip(test_data_src, test_data_tgt, hypotheses):
+                    print('Source: %s' % ' '.join(src_sent), file=f)
+                    print('Target: %s' % ' '.join(tgt_sent), file=f)
+                    print('Hypotheses:', file=f)
+                    for i, hyp in enumerate(hyps, 1):
+                        print('[%d] %s' % (i, ' '.join(hyp)), file=f)
+                    print('*' * 30, file=f)
 
 
 def sample(args):
