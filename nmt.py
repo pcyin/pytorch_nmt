@@ -100,7 +100,7 @@ def word2id(sents, vocab):
 
 def tensor_transform(linear, X):
     # X is a 3D tensor
-    return linear(X.view(-1, X.size(2))).view(X.size(0), X.size(1), -1)
+    return linear(X.contiguous().view(-1, X.size(2))).view(X.size(0), X.size(1), -1)
 
 
 class NMT(nn.Module):
@@ -114,22 +114,25 @@ class NMT(nn.Module):
         self.src_embed = nn.Embedding(len(vocab.src), args.embed_size, padding_idx=vocab.src['<pad>'])
         self.tgt_embed = nn.Embedding(len(vocab.tgt), args.embed_size, padding_idx=vocab.tgt['<pad>'])
 
-        self.encoder_lstm = nn.LSTM(args.embed_size, args.hidden_size / 2, bidirectional=True, dropout=args.dropout)
+        self.encoder_lstm = nn.LSTM(args.embed_size, args.hidden_size, bidirectional=True, dropout=args.dropout)
         self.decoder_lstm = nn.LSTMCell(args.embed_size + args.hidden_size, args.hidden_size)
 
         # attention: dot product attention
         # project source encoding to decoder rnn's h space
-        self.att_src_linear = nn.Linear(args.hidden_size, args.hidden_size, bias=False)
+        self.att_src_linear = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
 
         # transformation of decoder hidden states and context vectors before reading out target words
         # this produces the `attentional vector` in (Luong et al., 2015)
-        self.att_vec_linear = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
+        self.att_vec_linear = nn.Linear(args.hidden_size * 2 + args.hidden_size, args.hidden_size, bias=False)
 
         # prediction layer of the target vocabulary
         self.readout = nn.Linear(args.hidden_size, len(vocab.tgt), bias=False)
 
         # dropout layer
         self.dropout = nn.Dropout(args.dropout)
+
+        # initialize the decoder's state and cells with encoder hidden states
+        self.decoder_cell_init = nn.Linear(args.hidden_size * 2, args.hidden_size)
 
     def forward(self, src_sents, src_sents_len, tgt_words):
         src_encodings, init_ctx_vec = self.encode(src_sents, src_sents_len)
@@ -150,8 +153,8 @@ class NMT(nn.Module):
         output, (last_state, last_cell) = self.encoder_lstm(packed_src_embed)
         output, _ = pad_packed_sequence(output)
 
-        dec_init_state = torch.cat([last_state[0], last_state[1]], 1)
-        dec_init_cell = torch.cat([last_cell[0], last_cell[1]], 1)
+        dec_init_cell = self.decoder_cell_init(torch.cat([last_cell[0], last_cell[1]], 1))
+        dec_init_state = F.tanh(dec_init_cell)
 
         return output, (dec_init_state, dec_init_cell)
 
@@ -169,8 +172,10 @@ class NMT(nn.Module):
         new_tensor = init_cell.data.new
         batch_size = src_encoding.size(1)
 
-        # (batch_size, src_sent_len, hidden_size)
+        # (batch_size, src_sent_len, hidden_size * 2)
         src_encoding = src_encoding.t()
+        # (batch_size, src_sent_len, hidden_size)
+        src_encoding_att_linear = tensor_transform(self.att_src_linear, src_encoding)
         # initialize attentional vector
         att_tm1 = Variable(new_tensor(batch_size, self.args.hidden_size).zero_(), requires_grad=False)
 
@@ -186,7 +191,7 @@ class NMT(nn.Module):
             h_t, cell_t = self.decoder_lstm(x, hidden)
             h_t = self.dropout(h_t)
 
-            ctx_t, alpha_t = self.dot_prod_attention(h_t, src_encoding)
+            ctx_t, alpha_t = self.dot_prod_attention(h_t, src_encoding, src_encoding_att_linear)
 
             att_t = F.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t], 1)))   # E.q. (5)
             att_t = self.dropout(att_t)
@@ -213,6 +218,7 @@ class NMT(nn.Module):
         src_sents_var = to_input_variable(src_sents, self.vocab.src, cuda=args.cuda, is_test=True)
 
         src_encoding, dec_init_vec = self.encode(src_sents_var, [len(src_sents[0])])
+        src_encoding_att_linear = tensor_transform(self.att_src_linear, src_encoding)
 
         init_state = dec_init_vec[0]
         init_cell = dec_init_vec[1]
@@ -238,6 +244,7 @@ class NMT(nn.Module):
             hyp_num = len(hypotheses)
 
             expanded_src_encoding = src_encoding.expand(src_encoding.size(0), hyp_num, src_encoding.size(2))
+            expanded_src_encoding_att_linear = src_encoding_att_linear.expand(src_encoding_att_linear.size(0), hyp_num, src_encoding_att_linear.size(2))
 
             y_tm1 = Variable(torch.LongTensor([hyp[-1] for hyp in hypotheses]), volatile=True)
             if args.cuda:
@@ -251,7 +258,7 @@ class NMT(nn.Module):
             h_t, cell_t = self.decoder_lstm(x, hidden)
             h_t = self.dropout(h_t)
 
-            ctx_t, alpha_t = self.dot_prod_attention(h_t, expanded_src_encoding.t())
+            ctx_t, alpha_t = self.dot_prod_attention(h_t, expanded_src_encoding.t(), expanded_src_encoding_att_linear.t())
 
             att_t = F.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t], 1)))
             att_t = self.dropout(att_t)
@@ -411,17 +418,15 @@ class NMT(nn.Module):
 
         return ctx_vec, att_weights
 
-    def dot_prod_attention(self, h_t, src_encoding, mask=None):
+    def dot_prod_attention(self, h_t, src_encoding, src_encoding_att_linear, mask=None):
         """
         :param h_t: (batch_size, hidden_size)
-        :param src_encoding: (batch_size, src_sent_len, hidden_size)
+        :param src_encoding: (batch_size, src_sent_len, hidden_size * 2)
+        :param src_encoding_att_linear: (batch_size, src_sent_len, hidden_size)
         :param mask: (batch_size, src_sent_len)
         """
-        # (batch_size, hidden_size, 1)
-        h_t_linear = self.att_src_linear(h_t).unsqueeze(2)
-
         # (batch_size, src_sent_len)
-        att_weight = torch.bmm(src_encoding, h_t_linear).squeeze(2)
+        att_weight = torch.bmm(src_encoding_att_linear, h_t.unsqueeze(2)).squeeze(2)
         if mask:
             att_weight.data.masked_fill_(mask, -float('inf'))
         att_weight = F.softmax(att_weight)
