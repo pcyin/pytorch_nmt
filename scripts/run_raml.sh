@@ -12,12 +12,11 @@ train_log="train."${job_name}".log"
 model_name="model."${job_name}
 job_file="scripts/train."${job_name}".sh"
 decode_file=${job_name}".test.en"
-temp=0.6
+temp="0.6"
 
 python nmt.py \
-    --cuda \
     --mode raml_train \
-    --vocab iwslt.vocab.bin \
+    --vocab data/iwslt.vocab.bin \
     --save_to models/${model_name} \
     --valid_niter 15400 \
     --valid_metric ppl \
@@ -35,10 +34,9 @@ python nmt.py \
     --train_src ${train_src} \
     --train_tgt ${train_tgt} \
     --dev_src ${dev_src} \
-    --dev_tgt ${dev_tgt} 2>logs/${train_log}
+    --dev_tgt ${dev_tgt}
 
 python nmt.py \
-    --cuda \
     --mode test \
     --load_model models/${model_name}.bin \
     --beam_size 5 \
