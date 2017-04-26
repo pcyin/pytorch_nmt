@@ -322,8 +322,13 @@ class NMT(nn.Module):
 
         src_sents_num = len(src_sents)
         batch_size = src_sents_num * sample_size
+
         src_sents_var = to_input_variable(src_sents, self.vocab.src, cuda=args.cuda, is_test=True)
         src_encoding, (dec_init_state, dec_init_cell) = self.encode(src_sents_var, [len(s) for s in src_sents])
+
+        dec_init_state = dec_init_state.repeat(sample_size, 1)
+        dec_init_cell = dec_init_cell.repeat(sample_size, 1)
+        hidden = (dec_init_state, dec_init_cell)
 
         # tile everything
         # if args.sample_method == 'expand':
@@ -335,13 +340,11 @@ class NMT(nn.Module):
         # elif args.sample_method == 'repeat':
 
         src_encoding = src_encoding.repeat(1, sample_size, 1)
-        dec_init_state = dec_init_state.repeat(sample_size, 1)
-        dec_init_cell = dec_init_cell.repeat(sample_size, 1)
-
+        src_encoding_att_linear = tensor_transform(self.att_src_linear, src_encoding)
         src_encoding = src_encoding.t()
-        hidden = (dec_init_state, dec_init_cell)
-        new_tensor = dec_init_state.data.new
+        src_encoding_att_linear = src_encoding_att_linear.t()
 
+        new_tensor = dec_init_state.data.new
         att_tm1 = Variable(new_tensor(batch_size, self.args.hidden_size).zero_(), volatile=True)
         y_0 = Variable(torch.LongTensor([self.vocab.tgt['<s>'] for _ in xrange(batch_size)]), volatile=True)
 
@@ -368,7 +371,7 @@ class NMT(nn.Module):
             h_t, cell_t = self.decoder_lstm(x, hidden)
             h_t = self.dropout(h_t)
 
-            ctx_t, alpha_t = self.dot_prod_attention(h_t, src_encoding)
+            ctx_t, alpha_t = self.dot_prod_attention(h_t, src_encoding, src_encoding_att_linear)
 
             att_t = F.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t], 1)))  # E.q. (5)
             att_t = self.dropout(att_t)
