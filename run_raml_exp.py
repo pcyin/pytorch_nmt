@@ -16,7 +16,7 @@ for temp in [0.6, 0.8]:  # 0.75, 0.80, 0.85, 0.90, 0.95, 1.0
     with open(job_file, 'w') as f:
         f.write("""#!/bin/sh
 
-python tmp/nmt.py \
+python nmt.py \
     --cuda \
     --mode raml_train \
     --vocab iwslt.vocab.bin \
@@ -39,7 +39,7 @@ python tmp/nmt.py \
     --dev_src {dev_src} \
     --dev_tgt {dev_tgt} 2>logs/{train_log}
 
-python tmp/nmt.py \
+python nmt.py \
     --cuda \
     --mode test \
     --load_model models/{model_name}.bin \
