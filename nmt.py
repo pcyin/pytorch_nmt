@@ -61,6 +61,7 @@ def init_config():
     parser.add_argument('--lr_decay', default=0.5, type=float, help='decay learning rate if the validation performance drops')
 
     # raml training
+    parser.add_argument('--raml_sample_mode', default='weighted_uniform', choices=['uniform_n_weight', 'weighted_sample'])
     parser.add_argument('--temp', default=0.85, type=float, help='temperature in reward distribution')
     parser.add_argument('--raml_sample_file', type=str, help='path to the sampled targets')
 
@@ -698,8 +699,8 @@ def train_raml(args):
 
     vocab, model, optimizer, nll_loss, cross_entropy_loss = init_training(args)
 
-    train_iter = patience = cum_loss = report_loss = cum_tgt_words = report_tgt_words = 0
-    report_weighted_loss = cum_weighted_loss = 0
+    train_iter = patience = cum_tgt_words = report_tgt_words = 0
+    cum_nll_loss = report_nll_loss = report_objective_loss = cum_objective_loss = 0
     cum_examples = cum_batches = report_examples = epoch = valid_num = best_model_iter = 0
     hist_valid_scores = []
     train_time = begin_time = time.time()
@@ -716,11 +717,18 @@ def train_raml(args):
             for src_sent in src_sents:
                 tgt_samples_all = raml_samples[' '.join(src_sent)]
 
-                if args.sample_size >= len(tgt_samples_all):
-                    tgt_samples = tgt_samples_all
+                if args.raml_sample_mode == 'uniform_n_weight':
+                    if args.sample_size >= len(tgt_samples_all):
+                        tgt_samples = tgt_samples_all
+                    else:
+                        tgt_samples_id = np.random.choice(range(1, len(tgt_samples_all)), size=args.sample_size - 1, replace=False)
+                        tgt_samples = [tgt_samples_all[0]] + [tgt_samples_all[i] for i in tgt_samples_id] # make sure the ground truth y* is in the samples
+                elif args.raml_sample_mode == 'weighted_sample':
+                    tgt_samples_all_prob = [weight for sent, weight in tgt_samples_all]
+                    tgt_samples_id = np.random.choice(range(len(tgt_samples_all)), size=args.sample_size, p=tgt_samples_all_prob, replace=True)
+                    tgt_samples = [tgt_samples_all[i] for i in tgt_samples_id]
                 else:
-                    tgt_samples_id = np.random.choice(range(1, len(tgt_samples_all)), size=args.sample_size - 1, replace=False)
-                    tgt_samples = [tgt_samples_all[0]] + [tgt_samples_all[i] for i in tgt_samples_id] # make sure the ground truth y* is in the samples
+                    raise RuntimeError('unknown raml sample mode')
 
                 raml_src_sents.extend([src_sent] * len(tgt_samples))
                 raml_tgt_sents.extend([['<s>'] + sent.split(' ') + ['</s>'] for sent, weight in tgt_samples])
@@ -728,9 +736,6 @@ def train_raml(args):
 
             src_sents_var = to_input_variable(raml_src_sents, vocab.src, cuda=args.cuda)
             tgt_sents_var = to_input_variable(raml_tgt_sents, vocab.tgt, cuda=args.cuda)
-            weights_var = Variable(torch.FloatTensor(raml_tgt_weights), requires_grad=False)
-            if args.cuda:
-                weights_var = weights_var.cuda()
 
             batch_size = len(raml_src_sents)  # batch_size = args.batch_size * args.sample_size
             src_sents_len = [len(s) for s in raml_src_sents]
@@ -746,14 +751,27 @@ def train_raml(args):
             # batch_size * tgt_sent_len
             tgt_log_scores = torch.gather(log_scores, 1, flattened_tgt_sents.unsqueeze(1)).squeeze(1)
             unweighted_loss = -tgt_log_scores * (1. - torch.eq(flattened_tgt_sents, 0).float())
-            weighted_loss = unweighted_loss * weights_var.repeat(scores.size(0))
-            weighted_loss = weighted_loss.sum()
-            weighted_loss_val = weighted_loss.data[0]
-            nll_loss_val = unweighted_loss.sum().data[0]
+
+            if args.raml_sample_mode == 'uniform_n_weight':
+                weights_var = Variable(torch.FloatTensor(raml_tgt_weights), requires_grad=False)
+                if args.cuda:
+                    weights_var = weights_var.cuda()
+
+                weighted_loss = unweighted_loss * weights_var.repeat(scores.size(0))
+                weighted_loss = weighted_loss.sum()
+                objective_loss_val = weighted_loss.data[0]
+                nll_loss_val = unweighted_loss.sum().data[0]
+                loss = weighted_loss / batch_size
+            elif args.raml_sample_mode == 'weighted_sample':
+                unweighted_loss = unweighted_loss.sum()
+                objective_loss_val = nll_loss_val = unweighted_loss.data[0]
+                loss = unweighted_loss / batch_size
+            else:
+                raise RuntimeError('unknown raml sample mode')
+
             # weighted_log_scores = log_scores * weights.view(-1, scores.size(2))
             # weighted_loss = nll_loss(weighted_log_scores, flattened_tgt_sents)
 
-            loss = weighted_loss / batch_size
             # nll_loss_val = nll_loss(log_scores, flattened_tgt_sents).data[0]
 
             loss.backward()
@@ -761,10 +779,10 @@ def train_raml(args):
             grad_norm = torch.nn.utils.clip_grad_norm(model.parameters(), args.clip_grad)
             optimizer.step()
 
-            report_weighted_loss += weighted_loss_val
-            cum_weighted_loss += weighted_loss_val
-            report_loss += nll_loss_val
-            cum_loss += nll_loss_val
+            report_objective_loss += objective_loss_val
+            cum_objective_loss += objective_loss_val
+            report_nll_loss += nll_loss_val
+            cum_nll_loss += nll_loss_val
             report_tgt_words += pred_tgt_word_num
             cum_tgt_words += pred_tgt_word_num
             report_examples += batch_size
@@ -775,26 +793,26 @@ def train_raml(args):
                 print('epoch %d, iter %d, avg. loss %.2f, '
                       'avg. ppl %.2f cum. examples %d, '
                       'speed %.2f words/sec, time elapsed %.2f sec' % (epoch, train_iter,
-                                                                       report_weighted_loss / report_examples,
-                                                                       np.exp(report_loss / report_tgt_words),
+                                                                       report_objective_loss / report_examples,
+                                                                       np.exp(report_nll_loss / report_tgt_words),
                                                                        cum_examples,
                                                                        report_tgt_words / (time.time() - train_time),
                                                                        time.time() - begin_time),
                       file=sys.stderr)
 
                 train_time = time.time()
-                report_loss = report_weighted_loss = report_tgt_words = report_examples = 0.
+                report_nll_loss = report_objective_loss = report_tgt_words = report_examples = 0.
 
             # perform validation
             if train_iter % args.valid_niter == 0:
                 print('epoch %d, iter %d, cum. loss %.2f, '
                       'cum. ppl %.2f cum. examples %d' % (epoch, train_iter,
-                                                          cum_weighted_loss / cum_batches,
-                                                          np.exp(cum_loss / cum_tgt_words),
+                                                          cum_objective_loss / cum_batches,
+                                                          np.exp(cum_nll_loss / cum_tgt_words),
                                                           cum_examples),
                       file=sys.stderr)
 
-                cum_loss = cum_weighted_loss = cum_batches = cum_tgt_words = 0.
+                cum_nll_loss = cum_objective_loss = cum_batches = cum_tgt_words = 0.
                 valid_num += 1
 
                 print('begin validation ...', file=sys.stderr)
