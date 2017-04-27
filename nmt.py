@@ -61,7 +61,7 @@ def init_config():
     parser.add_argument('--lr_decay', default=0.5, type=float, help='decay learning rate if the validation performance drops')
 
     # raml training
-    parser.add_argument('--raml_sample_mode', default='weighted_uniform', choices=['uniform_n_weight', 'weighted_sample'])
+    parser.add_argument('--raml_sample_mode', default='uniform_n_weight', choices=['uniform_n_weight', 'weighted_sample'])
     parser.add_argument('--temp', default=0.85, type=float, help='temperature in reward distribution')
     parser.add_argument('--raml_sample_file', type=str, help='path to the sampled targets')
 
