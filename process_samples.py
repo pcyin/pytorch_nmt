@@ -103,11 +103,13 @@ def sample_ngram(args):
 
         tgt_len = len(tgt_sent)
         tgt_samples = []
+        tgt_samples_distort_rates = []    # how many unigrams are replaced
 
         # generate 100 samples
 
         # append itself
         tgt_samples.append(tgt_sent)
+        tgt_samples_distort_rates.append(0)
 
         for sid in xrange(args.sample_size - 1):
             n = np.random.randint(1, min(tgt_len, 5)) # we do not replace the last token: it must be a period!
@@ -120,14 +122,19 @@ def sample_ngram(args):
             sampled_tgt_sent[idx: idx+n] = new_ngram
 
             tgt_samples.append(sampled_tgt_sent)
+            tgt_samples_distort_rates.append(n)
 
-        # compute bleu scores and rank the samples by bleu scores
-        bleu_scores = []
-        for tgt_sample in tgt_samples:
-            bleu_score = sentence_bleu([tgt_sent], tgt_sample)
-            bleu_scores.append(bleu_score)
+        # compute bleu scores or edit distances and rank the samples by bleu scores
+        rewards = []
+        for tgt_sample, tgt_sample_distort_rate in zip(tgt_samples, tgt_samples_distort_rates):
+            if args.reward == 'bleu':
+                reward = sentence_bleu([tgt_sent], tgt_sample)
+            else:
+                reward = -tgt_sample_distort_rate
 
-        tgt_ranks = sorted(range(len(tgt_samples)), key=lambda i: bleu_scores[i], reverse=True)
+            rewards.append(reward)
+
+        tgt_ranks = sorted(range(len(tgt_samples)), key=lambda i: rewards[i], reverse=True)
         # convert list of tokens into a string
         tgt_samples = [' '.join(tgt_sample) for tgt_sample in tgt_samples]
 
@@ -135,7 +142,7 @@ def sample_ngram(args):
         print('source: ' + src_sent, file=f_out)
         print('%d samples' % len(tgt_samples), file=f_out)
         for i in tgt_ranks:
-            print('%s ||| %f' % (tgt_samples[i], bleu_scores[i]), file=f_out)
+            print('%s ||| %f' % (tgt_samples[i], rewards[i]), file=f_out)
         print('*' * 50, file=f_out)
 
     f_out.close()
@@ -151,6 +158,7 @@ if __name__ == '__main__':
     parser.add_argument('--sample_file', type=str)
     parser.add_argument('--output', type=str, required=True)
     parser.add_argument('--sample_size', type=int, default=100)
+    parser.add_argument('--reward', choices=['bleu', 'edit_dist'], default='bleu')
 
     args = parser.parse_args()
 
