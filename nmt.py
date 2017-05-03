@@ -349,10 +349,13 @@ class NMT(nn.Module):
         y_0 = Variable(torch.LongTensor([self.vocab.tgt['<s>'] for _ in xrange(batch_size)]), volatile=True)
 
         eos = self.vocab.tgt['</s>']
-        eos_batch = torch.LongTensor([eos] * batch_size)
+        # eos_batch = torch.LongTensor([eos] * batch_size)
+        sample_ends = torch.ByteTensor([0] * batch_size)
+        all_ones = torch.ByteTensor([1] * batch_size)
         if args.cuda:
             y_0 = y_0.cuda()
-            eos_batch = eos_batch.cuda()
+            sample_ends = sample_ends.cuda()
+            all_ones = all_ones.cuda()
 
         samples = [y_0]
 
@@ -387,8 +390,12 @@ class NMT(nn.Module):
 
             samples.append(y_t)
 
-            if torch.equal(y_t.data, eos_batch):
+            sample_ends |= torch.eq(y_t, eos).byte().data
+            if torch.equal(sample_ends, all_ones):
                 break
+
+            # if torch.equal(y_t.data, eos_batch):
+            #     break
 
             att_tm1 = att_t
             hidden = h_t, cell_t
@@ -678,6 +685,7 @@ def read_raml_train_data(data_file, temp):
             line = f.readline()
 
     return train_data
+
 
 def train_raml(args):
     vocab = torch.load(args.vocab)
