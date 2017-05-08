@@ -20,6 +20,7 @@ import argparse, os, sys
 
 from util import read_corpus, data_iter, batch_slice
 from vocab import Vocab, VocabEntry
+from process_samples import generate_hamming_distance_payoff_distribution
 
 
 def init_config():
@@ -62,6 +63,7 @@ def init_config():
 
     # raml training
     parser.add_argument('--temp', default=0.85, type=float, help='temperature in reward distribution')
+    parser.add_argument('--raml_sample_mode', default='pre_sample', choices=['pre_sample', 'hamming_distance'], help='sample mode when using RAML')
     parser.add_argument('--raml_sample_file', type=str, help='path to the sampled targets')
 
     #TODO: greedy sampling is still buggy!
@@ -698,11 +700,15 @@ def train_raml(args):
     dev_data_tgt = read_corpus(args.dev_tgt, source='tgt')
     dev_data = zip(dev_data_src, dev_data_tgt)
 
-    # dict of (src, [tgt: (sent, prob)])
-    print('read in raml training data...', file=sys.stderr, end='')
-    begin_time = time.time()
-    raml_samples = read_raml_train_data(args.raml_sample_file, temp=args.temp)
-    print('done[%d s].' % (time.time() - begin_time))
+    if args.raml_sample_mode == 'pre_sample':
+        # dict of (src, [tgt: (sent, prob)])
+        print('read in raml training data...', file=sys.stderr, end='')
+        begin_time = time.time()
+        raml_samples = read_raml_train_data(args.raml_sample_file, temp=args.temp)
+        print('done[%d s].' % (time.time() - begin_time))
+    elif args.raml_sample_mode == 'hamming_distance':
+        print('sample from hamming distance payoff distribution')
+        payoff_prob, Z_qs = generate_hamming_distance_payoff_distribution(max(len(sent) for sent in train_data_tgt), args.temp)
 
     vocab, model, optimizer, nll_loss, cross_entropy_loss = init_training(args)
 
@@ -721,18 +727,47 @@ def train_raml(args):
             raml_src_sents = []
             raml_tgt_sents = []
             raml_tgt_weights = []
-            for src_sent in src_sents:
-                tgt_samples_all = raml_samples[' '.join(src_sent)]
 
-                if args.sample_size >= len(tgt_samples_all):
-                    tgt_samples = tgt_samples_all
-                else:
-                    tgt_samples_id = np.random.choice(range(1, len(tgt_samples_all)), size=args.sample_size - 1, replace=False)
-                    tgt_samples = [tgt_samples_all[0]] + [tgt_samples_all[i] for i in tgt_samples_id] # make sure the ground truth y* is in the samples
+            if args.raml_sample_mode == 'pre_sample':
+                for src_sent in src_sents:
+                    tgt_samples_all = raml_samples[' '.join(src_sent)]
 
-                raml_src_sents.extend([src_sent] * len(tgt_samples))
-                raml_tgt_sents.extend([['<s>'] + sent.split(' ') + ['</s>'] for sent, weight in tgt_samples])
-                raml_tgt_weights.extend([weight for sent, weight in tgt_samples])
+                    if args.sample_size >= len(tgt_samples_all):
+                        tgt_samples = tgt_samples_all
+                    else:
+                        tgt_samples_id = np.random.choice(range(1, len(tgt_samples_all)), size=args.sample_size - 1, replace=False)
+                        tgt_samples = [tgt_samples_all[0]] + [tgt_samples_all[i] for i in tgt_samples_id] # make sure the ground truth y* is in the samples
+
+                    raml_src_sents.extend([src_sent] * len(tgt_samples))
+                    raml_tgt_sents.extend([['<s>'] + sent.split(' ') + ['</s>'] for sent, weight in tgt_samples])
+                    raml_tgt_weights.extend([weight for sent, weight in tgt_samples])
+            elif args.raml_sample_mode == 'hamming_distance':
+                for src_sent, tgt_sent in zip(src_sents, tgt_sents):
+                    tgt_samples = []  # make sure the ground truth y* is in the samples
+                    tgt_sent_len = len(tgt_sent) - 3 # remove <s> and </s> and ending period .
+                    # print('y*: %s' % ' '.join(tgt_sent))
+                    # sample an edit distances
+                    e_samples = np.random.choice(range(tgt_sent_len + 1), p=payoff_prob[tgt_sent_len], size=args.sample_size, replace=True)
+                    # make sure the ground truth y* is in the samples
+                    if not 0 in e_samples:
+                        e_samples[0] = 0
+
+                    for i, e in enumerate(e_samples):
+                        if e > 0:
+                            # sample a new tgt_sent $y$
+                            old_word_pos = np.random.choice(range(1, tgt_sent_len + 1), size=e, replace=False)
+                            new_words = [vocab.tgt.id2word[wid] for wid in np.random.randint(3, len(vocab.tgt), size=e)]
+                            new_tgt_sent = list(tgt_sent)
+                            for pos, word in zip(old_word_pos, new_words):
+                                new_tgt_sent[pos] = word
+                        else:
+                            new_tgt_sent = list(tgt_sent)
+                        # print('y: %s' % ' '.join(new_tgt_sent))
+                        tgt_samples.append(new_tgt_sent)
+
+                    raml_src_sents.extend([src_sent] * len(tgt_samples))
+                    raml_tgt_sents.extend(tgt_samples)
+                    raml_tgt_weights.extend([1.] * args.sample_size)
 
             src_sents_var = to_input_variable(raml_src_sents, vocab.src, cuda=args.cuda)
             tgt_sents_var = to_input_variable(raml_tgt_sents, vocab.tgt, cuda=args.cuda)
@@ -747,8 +782,9 @@ def train_raml(args):
 
             # (tgt_sent_len, batch_size, tgt_vocab_size)
             scores = model(src_sents_var, src_sents_len, tgt_sents_var[:-1])
+            # (tgt_sent_len * batch_size, tgt_vocab_size)
             log_scores = F.log_softmax(scores.view(-1, scores.size(2)))
-            # weights = weights_var.view(1, weights_var.size(0), 1).expand_as(scores).contiguous()
+            # remove leading <s> in tgt sent, which is not used as the target
             flattened_tgt_sents = tgt_sents_var[1:].view(-1)
 
             # batch_size * tgt_sent_len

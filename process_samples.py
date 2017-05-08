@@ -6,7 +6,9 @@ import argparse
 import torch
 from util import read_corpus
 import numpy as np
+from scipy.misc import comb
 from vocab import Vocab, VocabEntry
+import math
 
 
 def is_valid_sample(sent):
@@ -112,7 +114,7 @@ def sample_ngram(args):
         tgt_samples_distort_rates.append(0)
 
         for sid in xrange(args.sample_size - 1):
-            n = np.random.randint(1, min(tgt_len, 5)) # we do not replace the last token: it must be a period!
+            n = np.random.randint(1, min(tgt_len, args.max_ngram_size + 1)) # we do not replace the last token: it must be a period!
 
             idx = np.random.randint(tgt_len - n)
             ngram = tgt_sent[idx: idx+n]
@@ -120,6 +122,9 @@ def sample_ngram(args):
 
             sampled_tgt_sent = list(tgt_sent)
             sampled_tgt_sent[idx: idx+n] = new_ngram
+
+            # compute the probability of this sample
+            # prob = 1. / args.max_ngram_size * 1. / (tgt_len - 1 + n) * 1 / (len(tgt_vocab) ** n)
 
             tgt_samples.append(sampled_tgt_sent)
             tgt_samples_distort_rates.append(n)
@@ -148,6 +153,25 @@ def sample_ngram(args):
     f_out.close()
 
 
+def generate_hamming_distance_payoff_distribution(max_sent_len, tau=1.):
+    """compute the q distribution for Hamming Distance (substitution only) as in the RAML paper"""
+    probs = dict()
+    Z_qs = dict()
+    for sent_len in xrange(1, max_sent_len + 1):
+        counts = [1]  # e = 0, count = 1
+        for e in xrange(1, sent_len + 1):
+            counts.append(comb(sent_len, e))
+
+        weighted_counts = [math.exp(-e / tau) * count for e, count in enumerate(counts)]
+        Z_qs[sent_len] = Z_q = sum(weighted_counts)
+        prob = [count / Z_q for count in weighted_counts]
+        probs[sent_len] = prob
+
+        # print('sent_len=%d, %s' % (sent_len, prob))
+
+    return probs, Z_qs
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=['sample_from_model', 'sample_ngram'], required=True)
@@ -159,6 +183,7 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=str, required=True)
     parser.add_argument('--sample_size', type=int, default=100)
     parser.add_argument('--reward', choices=['bleu', 'edit_dist'], default='bleu')
+    parser.add_argument('--max_ngram_size', type=int, default=4)
 
     args = parser.parse_args()
 
