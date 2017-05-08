@@ -11,7 +11,7 @@ from torch.nn import Parameter
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
-from nltk.translate.bleu_score import corpus_bleu
+from nltk.translate.bleu_score import corpus_bleu, sentence_bleu
 import time
 import numpy as np
 from collections import defaultdict, Counter, namedtuple
@@ -21,6 +21,7 @@ import argparse, os, sys
 from util import read_corpus, data_iter, batch_slice
 from vocab import Vocab, VocabEntry
 from process_samples import generate_hamming_distance_payoff_distribution
+import math
 
 
 def init_config():
@@ -63,7 +64,9 @@ def init_config():
 
     # raml training
     parser.add_argument('--temp', default=0.85, type=float, help='temperature in reward distribution')
-    parser.add_argument('--raml_sample_mode', default='pre_sample', choices=['pre_sample', 'hamming_distance'], help='sample mode when using RAML')
+    parser.add_argument('--raml_sample_mode', default='pre_sample',
+                        choices=['pre_sample', 'hamming_distance', 'hamming_distance_impt_sample'],
+                        help='sample mode when using RAML')
     parser.add_argument('--raml_sample_file', type=str, help='path to the sampled targets')
 
     #TODO: greedy sampling is still buggy!
@@ -691,6 +694,7 @@ def read_raml_train_data(data_file, temp):
 
 def train_raml(args):
     vocab = torch.load(args.vocab)
+    tau = args.temp
 
     train_data_src = read_corpus(args.train_src, source='src')
     train_data_tgt = read_corpus(args.train_tgt, source='tgt')
@@ -704,11 +708,11 @@ def train_raml(args):
         # dict of (src, [tgt: (sent, prob)])
         print('read in raml training data...', file=sys.stderr, end='')
         begin_time = time.time()
-        raml_samples = read_raml_train_data(args.raml_sample_file, temp=args.temp)
+        raml_samples = read_raml_train_data(args.raml_sample_file, temp=tau)
         print('done[%d s].' % (time.time() - begin_time))
-    elif args.raml_sample_mode == 'hamming_distance':
+    elif args.raml_sample_mode.startswith('hamming_distance'):
         print('sample from hamming distance payoff distribution')
-        payoff_prob, Z_qs = generate_hamming_distance_payoff_distribution(max(len(sent) for sent in train_data_tgt), args.temp)
+        payoff_prob, Z_qs = generate_hamming_distance_payoff_distribution(max(len(sent) for sent in train_data_tgt), tau=tau)
 
     vocab, model, optimizer, nll_loss, cross_entropy_loss = init_training(args)
 
@@ -741,10 +745,12 @@ def train_raml(args):
                     raml_src_sents.extend([src_sent] * len(tgt_samples))
                     raml_tgt_sents.extend([['<s>'] + sent.split(' ') + ['</s>'] for sent, weight in tgt_samples])
                     raml_tgt_weights.extend([weight for sent, weight in tgt_samples])
-            elif args.raml_sample_mode == 'hamming_distance':
+            elif args.raml_sample_mode in ['hamming_distance', 'hamming_distance_impt_sample']:
                 for src_sent, tgt_sent in zip(src_sents, tgt_sents):
                     tgt_samples = []  # make sure the ground truth y* is in the samples
                     tgt_sent_len = len(tgt_sent) - 3 # remove <s> and </s> and ending period .
+                    tgt_ref_tokens = tgt_sent[1:-1]
+                    bleu_scores = []
                     # print('y*: %s' % ' '.join(tgt_sent))
                     # sample an edit distances
                     e_samples = np.random.choice(range(tgt_sent_len + 1), p=payoff_prob[tgt_sent_len], size=args.sample_size, replace=True)
@@ -762,12 +768,30 @@ def train_raml(args):
                                 new_tgt_sent[pos] = word
                         else:
                             new_tgt_sent = list(tgt_sent)
+
+                        # if enable importance sampling, compute bleu score
+                        if args.raml_sample_mode == 'hamming_distance_impt_sample':
+                            if e > 0:
+                                # remove <s> and </s>
+                                bleu_score = sentence_bleu([tgt_ref_tokens], new_tgt_sent[1:-1])
+                                bleu_scores.append(bleu_score)
+                            else:
+                                bleu_scores.append(1.)
+
                         # print('y: %s' % ' '.join(new_tgt_sent))
                         tgt_samples.append(new_tgt_sent)
 
+                    # if enable importance sampling, compute importance weight
+                    if args.raml_sample_mode == 'hamming_distance_impt_sample':
+                        tgt_sample_weights = [math.exp(bleu_score / tau) / math.exp(-e / tau) for bleu_score, e in zip(e_samples, bleu_scores)]
+                        normalizer = sum(tgt_sample_weights)
+                        tgt_sample_weights = [w / normalizer for w in tgt_sample_weights]
+                    else:
+                        tgt_sample_weights = [1.] * args.sample_size
+
                     raml_src_sents.extend([src_sent] * len(tgt_samples))
                     raml_tgt_sents.extend(tgt_samples)
-                    raml_tgt_weights.extend([1.] * args.sample_size)
+                    raml_tgt_weights.extend(tgt_sample_weights)
 
             src_sents_var = to_input_variable(raml_src_sents, vocab.src, cuda=args.cuda)
             tgt_sents_var = to_input_variable(raml_tgt_sents, vocab.tgt, cuda=args.cuda)
