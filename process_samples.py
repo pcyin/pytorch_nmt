@@ -152,6 +152,66 @@ def sample_ngram(args):
 
     f_out.close()
 
+def sample_ngram_adapt(args):
+    src_sents = read_corpus(args.src, 'src')
+    tgt_sents = read_corpus(args.tgt, 'src')  # do not read in <s> and </s>
+    f_out = open(args.output, 'w')
+
+    vocab = torch.load(args.vocab)
+    tgt_vocab = vocab.tgt
+
+    max_len = max([len(tgt_sent) for tgt_sent in tgt_sents]) + 1
+
+    for src_sent, tgt_sent in zip(src_sents, tgt_sents):
+        src_sent = ' '.join(src_sent)
+
+        tgt_len = len(tgt_sent)
+        tgt_samples = []
+
+        # generate 100 samples
+
+        # append itself
+        tgt_samples.append(tgt_sent)
+
+        for sid in xrange(args.sample_size - 1):
+            max_n = min(tgt_len - 1, 4)
+            bias_n = int(max_n * tgt_len / max_len) + 1
+            assert 1 <= bias_n <= 4, 'bias_n={}, not in [1,4], max_n={}, tgt_len={}, max_len={}'.format(bias_n, max_n, tgt_len, max_len)
+
+            p = [1.0/(max_n + 5)] * max_n
+            p[bias_n - 1] = 1 - p[0] * (max_n - 1)
+            assert abs(sum(p) - 1) < 1e-10, 'sum(p) != 1'
+
+            n = np.random.choice(np.arange(1, int(max_n + 1)), p=p)  # we do not replace the last token: it must be a period!
+            assert n < tgt_len, 'n={}, tgt_len={}'.format(n, tgt_len)
+
+            idx = np.random.randint(tgt_len - n)
+            ngram = tgt_sent[idx: idx+n]
+            new_ngram = get_new_ngram(ngram, n, tgt_vocab)
+
+            sampled_tgt_sent = list(tgt_sent)
+            sampled_tgt_sent[idx: idx+n] = new_ngram
+
+            tgt_samples.append(sampled_tgt_sent)
+
+        # compute bleu scores and rank the samples by bleu scores
+        bleu_scores = []
+        for tgt_sample in tgt_samples:
+            bleu_score = sentence_bleu([tgt_sent], tgt_sample)
+            bleu_scores.append(bleu_score)
+
+        tgt_ranks = sorted(range(len(tgt_samples)), key=lambda i: bleu_scores[i], reverse=True)
+        # convert list of tokens into a string
+        tgt_samples = [' '.join(tgt_sample) for tgt_sample in tgt_samples]
+
+        print('*' * 50, file=f_out)
+        print('source: ' + src_sent, file=f_out)
+        print('%d samples' % len(tgt_samples), file=f_out)
+        for i in tgt_ranks:
+            print('%s ||| %f' % (tgt_samples[i], bleu_scores[i]), file=f_out)
+        print('*' * 50, file=f_out)
+
+    f_out.close()
 
 def generate_hamming_distance_payoff_distribution(max_sent_len, tau=1.):
     """compute the q distribution for Hamming Distance (substitution only) as in the RAML paper"""
@@ -174,7 +234,7 @@ def generate_hamming_distance_payoff_distribution(max_sent_len, tau=1.):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', choices=['sample_from_model', 'sample_ngram'], required=True)
+    parser.add_argument('--mode', choices=['sample_from_model', 'sample_ngram_adapt', 'sample_ngram'], required=True)
     parser.add_argument('--vocab', type=str)
     parser.add_argument('--src', type=str)
     parser.add_argument('--tgt', type=str)
@@ -191,3 +251,5 @@ if __name__ == '__main__':
         sample_ngram(args)
     elif args.mode == 'sample_from_model':
         sample_from_model(args)
+    elif args.mode == 'sample_ngram_adapt':
+        sample_ngram_adapt(args)
