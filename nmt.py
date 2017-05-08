@@ -68,6 +68,7 @@ def init_config():
                         choices=['pre_sample', 'hamming_distance', 'hamming_distance_impt_sample'],
                         help='sample mode when using RAML')
     parser.add_argument('--raml_sample_file', type=str, help='path to the sampled targets')
+    parser.add_argument('--raml_bias_groundtruth', action='store_true', default=False, help='make sure ground truth y* is in samples')
 
     #TODO: greedy sampling is still buggy!
     parser.add_argument('--sample_method', default='random', choices=['random', 'greedy'])
@@ -754,8 +755,9 @@ def train_raml(args):
                     # print('y*: %s' % ' '.join(tgt_sent))
                     # sample an edit distances
                     e_samples = np.random.choice(range(tgt_sent_len + 1), p=payoff_prob[tgt_sent_len], size=args.sample_size, replace=True)
+
                     # make sure the ground truth y* is in the samples
-                    if not 0 in e_samples:
+                    if args.raml_bias_groundtruth and (not 0 in e_samples):
                         e_samples[0] = 0
 
                     for i, e in enumerate(e_samples):
