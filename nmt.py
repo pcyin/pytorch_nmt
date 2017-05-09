@@ -694,7 +694,6 @@ def read_raml_train_data(data_file, temp):
 
 
 def train_raml(args):
-    vocab = torch.load(args.vocab)
     tau = args.temp
 
     train_data_src = read_corpus(args.train_src, source='src')
@@ -705,6 +704,8 @@ def train_raml(args):
     dev_data_tgt = read_corpus(args.dev_tgt, source='tgt')
     dev_data = zip(dev_data_src, dev_data_tgt)
 
+    vocab, model, optimizer, nll_loss, cross_entropy_loss = init_training(args)
+
     if args.raml_sample_mode == 'pre_sample':
         # dict of (src, [tgt: (sent, prob)])
         print('read in raml training data...', file=sys.stderr, end='')
@@ -713,9 +714,9 @@ def train_raml(args):
         print('done[%d s].' % (time.time() - begin_time))
     elif args.raml_sample_mode.startswith('hamming_distance'):
         print('sample from hamming distance payoff distribution')
-        payoff_prob, Z_qs = generate_hamming_distance_payoff_distribution(max(len(sent) for sent in train_data_tgt), tau=tau)
-
-    vocab, model, optimizer, nll_loss, cross_entropy_loss = init_training(args)
+        payoff_prob, Z_qs = generate_hamming_distance_payoff_distribution(max(len(sent) for sent in train_data_tgt),
+                                                                          vocab_size=len(vocab.tgt),
+                                                                          tau=tau)
 
     train_iter = patience = cum_loss = report_loss = cum_tgt_words = report_tgt_words = 0
     report_weighted_loss = cum_weighted_loss = 0
@@ -785,7 +786,7 @@ def train_raml(args):
 
                     # if enable importance sampling, compute importance weight
                     if args.raml_sample_mode == 'hamming_distance_impt_sample':
-                        tgt_sample_weights = [math.exp(bleu_score / tau) / math.exp(-e / tau) for bleu_score, e in zip(e_samples, bleu_scores)]
+                        tgt_sample_weights = [math.exp(bleu_score / tau) / math.exp(-e / tau) for e, bleu_score in zip(e_samples, bleu_scores)]
                         normalizer = sum(tgt_sample_weights)
                         tgt_sample_weights = [w / normalizer for w in tgt_sample_weights]
                     else:

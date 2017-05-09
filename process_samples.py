@@ -213,18 +213,19 @@ def sample_ngram_adapt(args):
 
     f_out.close()
 
-def generate_hamming_distance_payoff_distribution(max_sent_len, tau=1.):
+def generate_hamming_distance_payoff_distribution(max_sent_len, vocab_size, tau=1.):
     """compute the q distribution for Hamming Distance (substitution only) as in the RAML paper"""
     probs = dict()
     Z_qs = dict()
     for sent_len in xrange(1, max_sent_len + 1):
-        counts = [1]  # e = 0, count = 1
+        counts = [1.]  # e = 0, count = 1
         for e in xrange(1, sent_len + 1):
-            counts.append(comb(sent_len, e))
+            # apply the rescaling trick as in https://gist.github.com/norouzi/8c4d244922fa052fa8ec18d8af52d366
+            count = comb(sent_len, e) * math.exp(-e / tau) * (vocab_size ** (e - e / tau))
+            counts.append(count)
 
-        weighted_counts = [math.exp(-e / tau) * count for e, count in enumerate(counts)]
-        Z_qs[sent_len] = Z_q = sum(weighted_counts)
-        prob = [count / Z_q for count in weighted_counts]
+        Z_qs[sent_len] = Z_q = sum(counts)
+        prob = [count / Z_q for count in counts]
         probs[sent_len] = prob
 
         # print('sent_len=%d, %s' % (sent_len, prob))
