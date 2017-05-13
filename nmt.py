@@ -715,7 +715,7 @@ def train_raml(args):
     elif args.raml_sample_mode.startswith('hamming_distance'):
         print('sample from hamming distance payoff distribution')
         payoff_prob, Z_qs = generate_hamming_distance_payoff_distribution(max(len(sent) for sent in train_data_tgt),
-                                                                          vocab_size=len(vocab.tgt),
+                                                                          vocab_size=len(vocab.tgt) - 3,
                                                                           tau=tau)
 
     train_iter = patience = cum_loss = report_loss = cum_tgt_words = report_tgt_words = 0
