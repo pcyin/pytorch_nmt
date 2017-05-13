@@ -152,6 +152,7 @@ def sample_ngram(args):
 
     f_out.close()
 
+
 def sample_ngram_adapt(args):
     src_sents = read_corpus(args.src, 'src')
     tgt_sents = read_corpus(args.tgt, 'src')  # do not read in <s> and </s>
@@ -213,6 +214,48 @@ def sample_ngram_adapt(args):
 
     f_out.close()
 
+
+def sample_from_hamming_distance_payoff_distribution(args):
+    src_sents = read_corpus(args.src, 'src')
+    tgt_sents = read_corpus(args.tgt, 'src')  # do not read in <s> and </s>
+    f_out = open(args.output, 'w')
+
+    vocab = torch.load(args.vocab)
+    tgt_vocab = vocab.tgt
+
+    payoff_prob, Z_qs = generate_hamming_distance_payoff_distribution(max(len(sent) for sent in tgt_sents),
+                                                                      vocab_size=len(vocab.tgt),
+                                                                      tau=args.temp)
+
+    for src_sent, tgt_sent in zip(src_sents, tgt_sents):
+        tgt_samples = []  # make sure the ground truth y* is in the samples
+        tgt_sent_len = len(tgt_sent) - 3  # remove <s> and </s> and ending period .
+        tgt_ref_tokens = tgt_sent[1:-1]
+        bleu_scores = []
+
+        # sample an edit distances
+        e_samples = np.random.choice(range(tgt_sent_len + 1), p=payoff_prob[tgt_sent_len], size=args.sample_size,
+                                     replace=True)
+
+        for i, e in enumerate(e_samples):
+            if e > 0:
+                # sample a new tgt_sent $y$
+                old_word_pos = np.random.choice(range(1, tgt_sent_len + 1), size=e, replace=False)
+                new_words = [vocab.tgt.id2word[wid] for wid in np.random.randint(3, len(vocab.tgt), size=e)]
+                new_tgt_sent = list(tgt_sent)
+                for pos, word in zip(old_word_pos, new_words):
+                    new_tgt_sent[pos] = word
+
+                bleu_score = sentence_bleu([tgt_ref_tokens], new_tgt_sent[1:-1])
+                bleu_scores.append(bleu_score)
+            else:
+                new_tgt_sent = list(tgt_sent)
+                bleu_scores.append(1.)
+
+            # print('y: %s' % ' '.join(new_tgt_sent))
+            tgt_samples.append(new_tgt_sent)
+
+
 def generate_hamming_distance_payoff_distribution(max_sent_len, vocab_size, tau=1.):
     """compute the q distribution for Hamming Distance (substitution only) as in the RAML paper"""
     probs = dict()
@@ -221,7 +264,7 @@ def generate_hamming_distance_payoff_distribution(max_sent_len, vocab_size, tau=
         counts = [1.]  # e = 0, count = 1
         for e in xrange(1, sent_len + 1):
             # apply the rescaling trick as in https://gist.github.com/norouzi/8c4d244922fa052fa8ec18d8af52d366
-            count = comb(sent_len, e) * math.exp(-e / tau) * (vocab_size ** (e - e / tau))
+            count = comb(sent_len, e) * math.exp(-e / tau) * ((vocab_size - 1) ** (e - e / tau))
             counts.append(count)
 
         Z_qs[sent_len] = Z_q = sum(counts)
@@ -245,6 +288,7 @@ if __name__ == '__main__':
     parser.add_argument('--sample_size', type=int, default=100)
     parser.add_argument('--reward', choices=['bleu', 'edit_dist'], default='bleu')
     parser.add_argument('--max_ngram_size', type=int, default=4)
+    parser.add_argument('--temp', type=float, default=0.5)
 
     args = parser.parse_args()
 
