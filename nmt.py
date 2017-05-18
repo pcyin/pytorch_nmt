@@ -11,7 +11,7 @@ from torch.nn import Parameter
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
-from nltk.translate.bleu_score import corpus_bleu, sentence_bleu
+from nltk.translate.bleu_score import corpus_bleu, sentence_bleu, SmoothingFunction
 import time
 import numpy as np
 from collections import defaultdict, Counter, namedtuple
@@ -69,6 +69,9 @@ def init_config():
                         help='sample mode when using RAML')
     parser.add_argument('--raml_sample_file', type=str, help='path to the sampled targets')
     parser.add_argument('--raml_bias_groundtruth', action='store_true', default=False, help='make sure ground truth y* is in samples')
+
+    parser.add_argument('--smooth_bleu', action='store_true', default=False,
+                        help='smooth sentence level BLEU score.')
 
     #TODO: greedy sampling is still buggy!
     parser.add_argument('--sample_method', default='random', choices=['random', 'greedy'])
@@ -725,6 +728,11 @@ def train_raml(args):
     train_time = begin_time = time.time()
     print('begin RAML training')
 
+    # smoothing function for BLEU
+    sm_func = None
+    if args.smooth_bleu:
+        sm_func = SmoothingFunction().method3
+
     while True:
         epoch += 1
         for src_sents, tgt_sents in data_iter(train_data, batch_size=args.batch_size):
@@ -776,7 +784,7 @@ def train_raml(args):
                         if args.raml_sample_mode == 'hamming_distance_impt_sample':
                             if e > 0:
                                 # remove <s> and </s>
-                                bleu_score = sentence_bleu([tgt_ref_tokens], new_tgt_sent[1:-1])
+                                bleu_score = sentence_bleu([tgt_ref_tokens], new_tgt_sent[1:-1], smoothing_function=sm_func)
                                 bleu_scores.append(bleu_score)
                             else:
                                 bleu_scores.append(1.)
