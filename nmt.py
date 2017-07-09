@@ -28,7 +28,7 @@ def init_config():
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', default=5783287, type=int, help='random seed')
     parser.add_argument('--cuda', action='store_true', default=False, help='use gpu')
-    parser.add_argument('--mode', choices=['train', 'raml_train', 'test', 'sample'], default='train', help='run mode')
+    parser.add_argument('--mode', choices=['train', 'raml_train', 'test', 'sample', 'prob'], default='train', help='run mode')
     parser.add_argument('--vocab', type=str, help='path of the serialized vocabulary')
     parser.add_argument('--batch_size', default=32, type=int, help='batch size')
     parser.add_argument('--beam_size', default=5, type=int, help='beam size for beam search')
@@ -992,6 +992,68 @@ def decode(model, data, verbose=True):
     return hypotheses
 
 
+def compute_lm_prob(args):
+    """
+    given source-target sentence pairs, compute ppl and log-likelihood
+    """
+    test_data_src = read_corpus(args.test_src, source='src')
+    test_data_tgt = read_corpus(args.test_tgt, source='tgt')
+    test_data = zip(test_data_src, test_data_tgt)
+
+    if args.load_model:
+        print('load model from [%s]' % args.load_model, file=sys.stderr)
+        params = torch.load(args.load_model, map_location=lambda storage, loc: storage)
+        vocab = params['vocab']
+        saved_args = params['args']
+        state_dict = params['state_dict']
+
+        model = NMT(saved_args, vocab)
+        model.load_state_dict(state_dict)
+    else:
+        vocab = torch.load(args.vocab)
+        model = NMT(args, vocab)
+
+    model.eval()
+
+    if args.cuda:
+        model = model.cuda()
+
+    f = open(args.save_to_file, 'w')
+    for src_sent, tgt_sent in test_data:
+        src_sents = [src_sent]
+        tgt_sents = [tgt_sent]
+
+        batch_size = len(src_sents)
+        src_sents_len = [len(s) for s in src_sents]
+        pred_tgt_word_nums = [len(s[1:]) for s in tgt_sents]  # omitting leading `<s>`
+
+        # (sent_len, batch_size)
+        src_sents_var = to_input_variable(src_sents, model.vocab.src, cuda=args.cuda, is_test=True)
+        tgt_sents_var = to_input_variable(tgt_sents, model.vocab.tgt, cuda=args.cuda, is_test=True)
+
+        # (tgt_sent_len, batch_size, tgt_vocab_size)
+        scores = model(src_sents_var, src_sents_len, tgt_sents_var[:-1])
+        # (tgt_sent_len * batch_size, tgt_vocab_size)
+        log_scores = F.log_softmax(scores.view(-1, scores.size(2)))
+        # remove leading <s> in tgt sent, which is not used as the target
+        # (batch_size * tgt_sent_len)
+        flattened_tgt_sents = tgt_sents_var[1:].view(-1)
+        # (batch_size * tgt_sent_len)
+        tgt_log_scores = torch.gather(log_scores, 1, flattened_tgt_sents.unsqueeze(1)).squeeze(1)
+        # 0-index is the <pad> symbol
+        tgt_log_scores = tgt_log_scores * (1. - torch.eq(flattened_tgt_sents, 0).float())
+        # (tgt_sent_len, batch_size)
+        tgt_log_scores = tgt_log_scores.view(-1, batch_size) # .permute(1, 0)
+        # (batch_size)
+        tgt_sent_scores = tgt_log_scores.sum(dim=0).squeeze()
+        tgt_sent_word_scores = [tgt_sent_scores[i].data[0] / pred_tgt_word_nums[i] for i in xrange(batch_size)]
+
+        for src_sent, tgt_sent, score in zip(src_sents, tgt_sents, tgt_sent_word_scores):
+            f.write('%s ||| %s ||| %f\n' % (' '.join(src_sent), ' '.join(tgt_sent), score))
+
+    f.close()
+
+
 def test(args):
     test_data_src = read_corpus(args.test_src, source='src')
     test_data_tgt = read_corpus(args.test_tgt, source='tgt')
@@ -1104,5 +1166,7 @@ if __name__ == '__main__':
         sample(args)
     elif args.mode == 'test':
         test(args)
+    elif args.mode == 'prob':
+        compute_lm_prob(args)
     else:
         raise RuntimeError('unknown mode')
