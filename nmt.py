@@ -28,7 +28,8 @@ def init_config():
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', default=5783287, type=int, help='random seed')
     parser.add_argument('--cuda', action='store_true', default=False, help='use gpu')
-    parser.add_argument('--mode', choices=['train', 'raml_train', 'test', 'sample', 'prob'], default='train', help='run mode')
+    parser.add_argument('--mode', choices=['train', 'raml_train', 'test', 'sample', 'prob', 'interactive'],
+                        default='train', help='run mode')
     parser.add_argument('--vocab', type=str, help='path of the serialized vocabulary')
     parser.add_argument('--batch_size', default=32, type=int, help='batch size')
     parser.add_argument('--beam_size', default=5, type=int, help='beam size for beam search')
@@ -1105,6 +1106,30 @@ def test(args):
                     print('*' * 30, file=f)
 
 
+def interactive(args):
+    assert args.load_model, 'You have to specify a pre-trained model'
+    print('load model from [%s]' % args.load_model, file=sys.stderr)
+    params = torch.load(args.load_model, map_location=lambda storage, loc: storage)
+    vocab = params['vocab']
+    saved_args = params['args']
+    state_dict = params['state_dict']
+
+    model = NMT(saved_args, vocab)
+    model.load_state_dict(state_dict)
+
+    model.eval()
+
+    if args.cuda:
+        model = model.cuda()
+
+    while True:
+        src_sent = raw_input('Source Sentence:')
+        src_sent = src_sent.strip().split(' ')
+        hyps = model.translate(src_sent)
+        for i, hyp in enumerate(hyps, 1):
+            print('Hypothesis #%d: %s' % (i, ' '.join(hyp)))
+
+
 def sample(args):
     train_data_src = read_corpus(args.train_src, source='src')
     train_data_tgt = read_corpus(args.train_tgt, source='tgt')
@@ -1168,5 +1193,7 @@ if __name__ == '__main__':
         test(args)
     elif args.mode == 'prob':
         compute_lm_prob(args)
+    elif args.mode == 'interactive':
+        interactive(args)
     else:
         raise RuntimeError('unknown mode')
