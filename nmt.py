@@ -215,7 +215,7 @@ class NMT(nn.Module):
         scores = torch.stack(scores)
         return scores
 
-    def translate(self, src_sents, beam_size=None, to_word=True):
+    def translate(self, src_sents, beam_size=None, to_word=True, return_score=False):
         """
         perform beam search
         TODO: batched beam search
@@ -322,7 +322,10 @@ class NMT(nn.Module):
 
         ranked_hypotheses = sorted(zip(completed_hypotheses, completed_hypothesis_scores), key=lambda x: x[1], reverse=True)
 
-        return [hyp for hyp, score in ranked_hypotheses]
+        if return_score:
+            return ranked_hypotheses
+        else:
+            return [hyp for hyp, score in ranked_hypotheses]
 
     def sample(self, src_sents, sample_size=None, to_word=False):
         if not type(src_sents[0]) == list:
@@ -759,7 +762,13 @@ def train_raml(args):
             elif args.raml_sample_mode in ['hamming_distance', 'hamming_distance_impt_sample']:
                 for src_sent, tgt_sent in zip(src_sents, tgt_sents):
                     tgt_samples = []  # make sure the ground truth y* is in the samples
-                    tgt_sent_len = len(tgt_sent) - 3 # remove <s> and </s> and ending period .
+
+                    if tgt_sent[-1] in {'.', '?', '!'}:
+                        tgt_sent_len = len(tgt_sent) - 3 # remove <s> and </s> and ending period .
+                    else:
+                        tgt_sent_len = len(tgt_sent) - 2  # remove <s> and </s>
+
+                    # remove <s> and </s>
                     tgt_ref_tokens = tgt_sent[1:-1]
                     bleu_scores = []
                     # print('y*: %s' % ' '.join(tgt_sent))
@@ -943,7 +952,7 @@ def get_bleu(references, hypotheses):
 
 
 def get_acc(references, hypotheses, acc_type='word'):
-    assert acc_type == 'word_acc' or acc_type == 'sent_acc'
+    assert acc_type in ['word_acc', 'sent_acc', 'logical_form_acc']
     cum_acc = 0.
 
     for ref, hyp in zip(references, hypotheses):
@@ -951,8 +960,11 @@ def get_acc(references, hypotheses, acc_type='word'):
         hyp = hyp[1:-1]
         if acc_type == 'word_acc':
             acc = len([1 for ref_w, hyp_w in zip(ref, hyp) if ref_w == hyp_w]) / float(len(hyp) + 1e-6)
+        elif acc_type == 'sent_acc':
+            acc = 1. if len(ref) == len(hyp) and all(ref_w == hyp_w for ref_w, hyp_w in zip(ref, hyp)) else 0.
         else:
-            acc = 1. if all(ref_w == hyp_w for ref_w, hyp_w in zip(ref, hyp)) else 0.
+            raise NotImplementedError()
+
         cum_acc += acc
 
     acc = cum_acc / len(hypotheses)
@@ -1125,9 +1137,9 @@ def interactive(args):
     while True:
         src_sent = raw_input('Source Sentence:')
         src_sent = src_sent.strip().split(' ')
-        hyps = model.translate(src_sent)
-        for i, hyp in enumerate(hyps, 1):
-            print('Hypothesis #%d: %s' % (i, ' '.join(hyp)))
+        hyps = model.translate(src_sent, return_score=True)
+        for i, (hyp, hyp_score) in enumerate(hyps, 1):
+            print('Hypothesis #%d: %s \t score:%.4f' % (i, ' '.join(hyp), hyp_score))
 
 
 def sample(args):
