@@ -211,8 +211,8 @@ class NMT(nn.Module):
                 att_batches = force_attention_map[t]
                 for batch_id, src_step in att_batches:
                     att_prob = alpha_t[batch_id][src_step]
-                    log_att_prob = torch.log(att_prob)
-                    force_attention_probs.append(log_att_prob)
+                    neg_log_att_prob = -torch.log(att_prob)
+                    force_attention_probs.append(neg_log_att_prob)
 
             att_t = F.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t], 1)))   # E.q. (5)
             att_t = self.dropout(att_t)
@@ -594,13 +594,13 @@ def train(args):
             word_loss = cross_entropy_loss(scores.view(-1, scores.size(2)), tgt_sents_var[1:].view(-1))
             loss = word_loss / batch_size
 
+            word_loss_val = word_loss.data[0]
+            loss_val = loss.data[0]
+
             if force_attention_map:
                 force_attention_loss = torch.sum(torch.cat(force_attention_probs))
                 force_attention_loss_val = force_attention_loss.data[0]
                 loss += 1.0 * force_attention_loss / len(force_attention_probs)
-
-            word_loss_val = word_loss.data[0]
-            loss_val = loss.data[0]
 
             loss.backward()
             # clip gradient
@@ -627,7 +627,7 @@ def train(args):
                                                                                          time.time() - begin_time), file=sys.stderr)
 
                 train_time = time.time()
-                report_loss = report_tgt_words = report_examples = 0.
+                report_loss = report_tgt_words = report_examples = report_force_attention_loss = 0.
 
             # perform validation
             if train_iter % args.valid_niter == 0:
@@ -756,7 +756,7 @@ def train_raml(args):
                                                                           vocab_size=len(vocab.tgt) - 3,
                                                                           tau=tau)
 
-    train_iter = patience = cum_loss = report_loss = cum_tgt_words = report_tgt_words = 0
+    train_iter = patience = cum_loss = report_loss = report_force_attention_loss = cum_tgt_words = report_tgt_words = 0
     report_weighted_loss = cum_weighted_loss = 0
     cum_examples = cum_batches = report_examples = epoch = valid_num = best_model_iter = 0
     hist_valid_scores = []
@@ -767,6 +767,8 @@ def train_raml(args):
     sm_func = None
     if args.smooth_bleu:
         sm_func = SmoothingFunction().method3
+
+    force_attention_rules = [('meal', 'has_meal'), ('one way', 'one_way')]
 
     while True:
         epoch += 1
@@ -847,6 +849,8 @@ def train_raml(args):
 
             src_sents_var = to_input_variable(raml_src_sents, vocab.src, cuda=args.cuda)
             tgt_sents_var = to_input_variable(raml_tgt_sents, vocab.tgt, cuda=args.cuda)
+            force_attention_map = generate_force_attention_map(src_sents, tgt_sents, force_attention_rules)
+
             weights_var = Variable(torch.FloatTensor(raml_tgt_weights), requires_grad=False)
             if args.cuda:
                 weights_var = weights_var.cuda()
@@ -856,8 +860,14 @@ def train_raml(args):
             pred_tgt_word_num = sum(len(s[1:]) for s in raml_tgt_sents)  # omitting leading `<s>`
             optimizer.zero_grad()
 
-            # (tgt_sent_len, batch_size, tgt_vocab_size)
-            scores = model(src_sents_var, src_sents_len, tgt_sents_var[:-1])
+            return_values = model(src_sents_var, src_sents_len, tgt_sents_var[:-1],
+                                  force_attention_map=force_attention_map)
+            if force_attention_map:
+                # (tgt_sent_len, batch_size, tgt_vocab_size)
+                scores, force_attention_probs = return_values
+            else:
+                scores = return_values
+
             # (tgt_sent_len * batch_size, tgt_vocab_size)
             log_scores = F.log_softmax(scores.view(-1, scores.size(2)))
             # remove leading <s> in tgt sent, which is not used as the target
@@ -876,12 +886,18 @@ def train_raml(args):
             loss = weighted_loss / batch_size
             # nll_loss_val = nll_loss(log_scores, flattened_tgt_sents).data[0]
 
+            if force_attention_map:
+                force_attention_loss = torch.sum(torch.cat(force_attention_probs))
+                force_attention_loss_val = force_attention_loss.data[0]
+                loss += 1.0 * force_attention_loss / len(force_attention_probs)
+
             loss.backward()
             # clip gradient
             grad_norm = torch.nn.utils.clip_grad_norm(model.parameters(), args.clip_grad)
             optimizer.step()
 
             report_weighted_loss += weighted_loss_val
+            report_force_attention_loss += force_attention_loss_val if force_attention_map else 0.
             cum_weighted_loss += weighted_loss_val
             report_loss += nll_loss_val
             cum_loss += nll_loss_val
@@ -892,10 +908,11 @@ def train_raml(args):
             cum_batches += batch_size
 
             if train_iter % args.log_every == 0:
-                print('epoch %d, iter %d, avg. loss %.2f, '
+                print('epoch %d, iter %d, avg. loss %.2f, avg. force attention loss %.2f, '
                       'avg. ppl %.2f cum. examples %d, '
                       'speed %.2f words/sec, time elapsed %.2f sec' % (epoch, train_iter,
                                                                        report_weighted_loss / report_examples,
+                                                                       report_force_attention_loss / report_examples,
                                                                        np.exp(report_loss / report_tgt_words),
                                                                        cum_examples,
                                                                        report_tgt_words / (time.time() - train_time),
@@ -903,7 +920,7 @@ def train_raml(args):
                       file=sys.stderr)
 
                 train_time = time.time()
-                report_loss = report_weighted_loss = report_tgt_words = report_examples = 0.
+                report_loss = report_weighted_loss = report_force_attention_loss = report_tgt_words = report_examples = 0.
 
             # perform validation
             if train_iter % args.valid_niter == 0:
