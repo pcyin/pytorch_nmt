@@ -49,3 +49,26 @@ def data_iter(data, batch_size, shuffle=True):
         np.random.shuffle(batched_data)
     for batch in batched_data:
         yield batch
+
+
+def generate_force_attention_map(src_sents, tgt_sents, force_attention_rules):
+    force_attention_map = defaultdict(list)
+    for src_words, tgt_word in force_attention_rules:
+        src_words = src_words.split(' ')
+
+        for batch_id, (src_sent, tgt_sent) in enumerate(zip(src_sents, tgt_sents)):
+            if tgt_word in tgt_sent:
+                tgt_word_idx = tgt_sent.index(tgt_word)
+                src_word_idx = seq_index(src_sent, src_words)
+                if src_word_idx:
+                    # currently we only use the first occurrence of source word
+                    for _src_idx in xrange(src_word_idx[0][0], src_word_idx[0][1]):
+                        force_attention_map[tgt_word_idx].append((batch_id, _src_idx))
+
+    return force_attention_map
+
+
+def seq_index(a, b):
+    if b[0] in a:
+        return [(i, i + len(b)) for i in xrange(len(a)) if a[i:i + len(b)] == b]
+    return []

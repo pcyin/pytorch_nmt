@@ -18,7 +18,7 @@ from collections import defaultdict, Counter, namedtuple
 from itertools import chain, islice
 import argparse, os, sys
 
-from util import read_corpus, data_iter, batch_slice
+from util import read_corpus, data_iter, batch_slice, generate_force_attention_map
 from vocab import Vocab, VocabEntry
 from process_samples import generate_hamming_distance_payoff_distribution
 import math
@@ -144,9 +144,9 @@ class NMT(nn.Module):
         # initialize the decoder's state and cells with encoder hidden states
         self.decoder_cell_init = nn.Linear(args.hidden_size * 2, args.hidden_size)
 
-    def forward(self, src_sents, src_sents_len, tgt_words):
+    def forward(self, src_sents, src_sents_len, tgt_words, force_attention_map=None):
         src_encodings, init_ctx_vec = self.encode(src_sents, src_sents_len)
-        scores = self.decode(src_encodings, init_ctx_vec, tgt_words)
+        scores = self.decode(src_encodings, init_ctx_vec, tgt_words, force_attention_map=force_attention_map)
 
         return scores
 
@@ -168,12 +168,14 @@ class NMT(nn.Module):
 
         return output, (dec_init_state, dec_init_cell)
 
-    def decode(self, src_encoding, dec_init_vec, tgt_sents):
+    def decode(self, src_encoding, dec_init_vec, tgt_sents, force_attention_map=None):
         """
+        compute read-out scores over the target vocabulary, for all time steps
+
         :param src_encoding: (src_sent_len, batch_size, hidden_size)
         :param dec_init_vec: (batch_size, hidden_size)
         :param tgt_sents: (tgt_sent_len, batch_size)
-        :return:
+        :return: (tgt_sent_len, batch_size, tgt_vocab_size)
         """
         init_state = dec_init_vec[0]
         init_cell = dec_init_vec[1]
@@ -191,9 +193,10 @@ class NMT(nn.Module):
 
         tgt_word_embed = self.tgt_embed(tgt_sents)
         scores = []
+        force_attention_probs = []
 
         # start from `<s>`, until y_{T-1}
-        for y_tm1_embed in tgt_word_embed.split(split_size=1):
+        for t, y_tm1_embed in enumerate(tgt_word_embed.split(split_size=1)):
             # input feeding: concate y_tm1 and previous attentional vector
             x = torch.cat([y_tm1_embed.squeeze(0), att_tm1], 1)
 
@@ -203,9 +206,18 @@ class NMT(nn.Module):
 
             ctx_t, alpha_t = self.dot_prod_attention(h_t, src_encoding, src_encoding_att_linear)
 
+            # force attention
+            if force_attention_map and t in force_attention_map:
+                att_batches = force_attention_map[t]
+                for batch_id, src_step in att_batches:
+                    att_prob = alpha_t[batch_id][src_step]
+                    log_att_prob = torch.log(att_prob)
+                    force_attention_probs.append(log_att_prob)
+
             att_t = F.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t], 1)))   # E.q. (5)
             att_t = self.dropout(att_t)
 
+            # (batch_size, tgt_vocab_size)
             score_t = self.readout(att_t)   # E.q. (6)
             scores.append(score_t)
 
@@ -213,7 +225,11 @@ class NMT(nn.Module):
             hidden = h_t, cell_t
 
         scores = torch.stack(scores)
-        return scores
+
+        if force_attention_map:
+            return scores, force_attention_probs
+        else:
+            return scores
 
     def translate(self, src_sents, beam_size=None, to_word=True, return_score=False):
         """
@@ -545,11 +561,13 @@ def train(args):
 
     vocab, model, optimizer, nll_loss, cross_entropy_loss = init_training(args)
 
-    train_iter = patience = cum_loss = report_loss = cum_tgt_words = report_tgt_words = 0
+    train_iter = patience = cum_loss = report_loss = report_force_attention_loss = cum_tgt_words = report_tgt_words = 0
     cum_examples = cum_batches = report_examples = epoch = valid_num = best_model_iter = 0
     hist_valid_scores = []
     train_time = begin_time = time.time()
     print('begin Maximum Likelihood training')
+
+    force_attention_rules = [('meal', 'has_meal'), ('one way', 'one_way')]
 
     while True:
         epoch += 1
@@ -558,6 +576,7 @@ def train(args):
 
             src_sents_var = to_input_variable(src_sents, vocab.src, cuda=args.cuda)
             tgt_sents_var = to_input_variable(tgt_sents, vocab.tgt, cuda=args.cuda)
+            force_attention_map = generate_force_attention_map(src_sents, tgt_sents, force_attention_rules)
 
             batch_size = len(src_sents)
             src_sents_len = [len(s) for s in src_sents]
@@ -565,11 +584,21 @@ def train(args):
 
             optimizer.zero_grad()
 
-            # (tgt_sent_len, batch_size, tgt_vocab_size)
-            scores = model(src_sents_var, src_sents_len, tgt_sents_var[:-1])
+            return_values = model(src_sents_var, src_sents_len, tgt_sents_var[:-1], force_attention_map=force_attention_map)
+            if force_attention_map:
+                # (tgt_sent_len, batch_size, tgt_vocab_size)
+                scores, force_attention_probs = return_values
+            else:
+                scores = return_values
 
             word_loss = cross_entropy_loss(scores.view(-1, scores.size(2)), tgt_sents_var[1:].view(-1))
             loss = word_loss / batch_size
+
+            if force_attention_map:
+                force_attention_loss = torch.sum(torch.cat(force_attention_probs))
+                force_attention_loss_val = force_attention_loss.data[0]
+                loss += 1.0 * force_attention_loss / len(force_attention_probs)
+
             word_loss_val = word_loss.data[0]
             loss_val = loss.data[0]
 
@@ -580,6 +609,7 @@ def train(args):
 
             report_loss += word_loss_val
             cum_loss += word_loss_val
+            report_force_attention_loss += force_attention_loss_val if force_attention_map else 0.
             report_tgt_words += pred_tgt_word_num
             cum_tgt_words += pred_tgt_word_num
             report_examples += batch_size
@@ -587,9 +617,10 @@ def train(args):
             cum_batches += batch_size
 
             if train_iter % args.log_every == 0:
-                print('epoch %d, iter %d, avg. loss %.2f, avg. ppl %.2f ' \
+                print('epoch %d, iter %d, avg. loss %.2f, avg. force attention loss %.2f, avg. ppl %.2f ' \
                       'cum. examples %d, speed %.2f words/sec, time elapsed %.2f sec' % (epoch, train_iter,
                                                                                          report_loss / report_examples,
+                                                                                         report_force_attention_loss / report_examples,
                                                                                          np.exp(report_loss / report_tgt_words),
                                                                                          cum_examples,
                                                                                          report_tgt_words / (time.time() - train_time),
