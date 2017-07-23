@@ -1,5 +1,6 @@
 from __future__ import print_function
 from nltk.translate.bleu_score import sentence_bleu
+from nltk.translate.bleu_score import SmoothingFunction
 import sys
 import re
 import argparse
@@ -100,6 +101,11 @@ def sample_ngram(args):
     vocab = torch.load(args.vocab)
     tgt_vocab = vocab.tgt
 
+    smooth_bleu = args.smooth_bleu
+    sm_func = None
+    if smooth_bleu:
+        sm_func = SmoothingFunction().method3
+
     for src_sent, tgt_sent in zip(src_sents, tgt_sents):
         src_sent = ' '.join(src_sent)
 
@@ -133,7 +139,7 @@ def sample_ngram(args):
         rewards = []
         for tgt_sample, tgt_sample_distort_rate in zip(tgt_samples, tgt_samples_distort_rates):
             if args.reward == 'bleu':
-                reward = sentence_bleu([tgt_sent], tgt_sample)
+                reward = sentence_bleu([tgt_sent], tgt_sample, smoothing_function=sm_func)
             else:
                 reward = -tgt_sample_distort_rate
 
@@ -289,6 +295,7 @@ if __name__ == '__main__':
     parser.add_argument('--reward', choices=['bleu', 'edit_dist'], default='bleu')
     parser.add_argument('--max_ngram_size', type=int, default=4)
     parser.add_argument('--temp', type=float, default=0.5)
+    parser.add_argument('--smooth_bleu', action='store_true', default=False)
 
     args = parser.parse_args()
 
