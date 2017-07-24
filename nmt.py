@@ -1,27 +1,25 @@
 from __future__ import print_function
 
+import argparse
+import math
+import os
 import re
+import sys
+import time
 
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.utils
-from torch.autograd import Variable
-from torch import optim
-from torch.nn import Parameter
 import torch.nn.functional as F
+import torch.nn.utils
+from nltk.translate.bleu_score import corpus_bleu, sentence_bleu, SmoothingFunction
+from torch.autograd import Variable
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
-from nltk.translate.bleu_score import corpus_bleu, sentence_bleu, SmoothingFunction
-import time
-import numpy as np
-from collections import defaultdict, Counter, namedtuple
-from itertools import chain, islice
-import argparse, os, sys
-
-from util import read_corpus, data_iter, batch_slice, generate_force_attention_map
-from vocab import Vocab, VocabEntry
 from process_samples import generate_hamming_distance_payoff_distribution
-import math
+from util import read_corpus, data_iter, to_input_variable, length_array_to_mask_tensor, word2id, tensor_transform, \
+    generate_force_attention_map
+from vocab import Vocab, VocabEntry
 
 
 def init_config():
@@ -36,6 +34,7 @@ def init_config():
     parser.add_argument('--sample_size', default=10, type=int, help='sample size')
     parser.add_argument('--embed_size', default=256, type=int, help='size of word embeddings')
     parser.add_argument('--hidden_size', default=256, type=int, help='size of LSTM hidden states')
+    parser.add_argument('--layer_num', default=1, type=int, help='number of layers for the RNN encoder/decoder')
     parser.add_argument('--dropout', default=0., type=float, help='dropout rate')
 
     parser.add_argument('--train_src', type=str, help='path to the training source file')
@@ -88,31 +87,6 @@ def init_config():
     return args
 
 
-def input_transpose(sents, pad_token):
-    max_len = max(len(s) for s in sents)
-    batch_size = len(sents)
-
-    sents_t = []
-    masks = []
-    for i in xrange(max_len):
-        sents_t.append([sents[k][i] if len(sents[k]) > i else pad_token for k in xrange(batch_size)])
-        masks.append([1 if len(sents[k]) > i else 0 for k in xrange(batch_size)])
-
-    return sents_t, masks
-
-
-def word2id(sents, vocab):
-    if type(sents[0]) == list:
-        return [[vocab[w] for w in s] for s in sents]
-    else:
-        return [vocab[w] for w in sents]
-
-
-def tensor_transform(linear, X):
-    # X is a 3D tensor
-    return linear(X.contiguous().view(-1, X.size(2))).view(X.size(0), X.size(1), -1)
-
-
 class NMT(nn.Module):
     def __init__(self, args, vocab):
         super(NMT, self).__init__()
@@ -146,7 +120,7 @@ class NMT(nn.Module):
 
     def forward(self, src_sents, src_sents_len, tgt_words, force_attention_map=None):
         src_encodings, init_ctx_vec = self.encode(src_sents, src_sents_len)
-        scores = self.decode(src_encodings, init_ctx_vec, tgt_words, force_attention_map=force_attention_map)
+        scores = self.decode(src_encodings, src_sents_len, init_ctx_vec, tgt_words, force_attention_map=force_attention_map)
 
         return scores
 
@@ -168,7 +142,7 @@ class NMT(nn.Module):
 
         return output, (dec_init_state, dec_init_cell)
 
-    def decode(self, src_encoding, dec_init_vec, tgt_sents, force_attention_map=None):
+    def decode(self, src_encoding, src_sents_len, dec_init_vec, tgt_sents, force_attention_map=None):
         """
         compute read-out scores over the target vocabulary, for all time steps
 
@@ -184,6 +158,8 @@ class NMT(nn.Module):
         new_tensor = init_cell.data.new
         batch_size = src_encoding.size(1)
 
+        # (batch_size, src_sent_len)
+        src_mask = length_array_to_mask_tensor(src_sents_len, cuda=args.cuda)
         # (batch_size, src_sent_len, hidden_size * 2)
         src_encoding = src_encoding.t()
         # (batch_size, src_sent_len, hidden_size)
@@ -204,7 +180,7 @@ class NMT(nn.Module):
             h_t, cell_t = self.decoder_lstm(x, hidden)
             h_t = self.dropout(h_t)
 
-            ctx_t, alpha_t = self.dot_prod_attention(h_t, src_encoding, src_encoding_att_linear)
+            ctx_t, alpha_t = self.dot_prod_attention(h_t, src_encoding, src_encoding_att_linear, mask=src_mask)
 
             # force attention
             if force_attention_map and t in force_attention_map:
@@ -466,7 +442,7 @@ class NMT(nn.Module):
         """
         # (batch_size, src_sent_len)
         att_weight = torch.bmm(src_encoding_att_linear, h_t.unsqueeze(2)).squeeze(2)
-        if mask:
+        if mask is not None:
             att_weight.data.masked_fill_(mask, -float('inf'))
         att_weight = F.softmax(att_weight)
 
@@ -484,21 +460,6 @@ class NMT(nn.Module):
             'state_dict': self.state_dict()
         }
         torch.save(params, path)
-
-
-def to_input_variable(sents, vocab, cuda=False, is_test=False):
-    """
-    return a tensor of shape (src_sent_len, batch_size)
-    """
-
-    word_ids = word2id(sents, vocab)
-    sents_t, masks = input_transpose(word_ids, vocab['<pad>'])
-
-    sents_var = Variable(torch.LongTensor(sents_t), volatile=is_test, requires_grad=False)
-    if cuda:
-        sents_var = sents_var.cuda()
-
-    return sents_var
 
 
 def evaluate_loss(model, data, crit):
