@@ -183,7 +183,7 @@ class NMT(nn.Module):
         batch_size = src_encoding.size(1)
 
         # (batch_size, src_sent_len, hidden_size * 2)
-        src_encoding = src_encoding.t()
+        src_encoding = src_encoding.permute(1, 0, 2)
         # (batch_size, src_sent_len, hidden_size)
         src_encoding_att_linear = tensor_transform(self.att_src_linear, src_encoding)
         # initialize attentional vector
@@ -268,7 +268,7 @@ class NMT(nn.Module):
             h_t, cell_t = self.decoder_lstm(x, hidden)
             h_t = self.dropout(h_t)
 
-            ctx_t, alpha_t = self.dot_prod_attention(h_t, expanded_src_encoding.t(), expanded_src_encoding_att_linear.t())
+            ctx_t, alpha_t = self.dot_prod_attention(h_t, expanded_src_encoding.permute(1, 0, 2), expanded_src_encoding_att_linear.permute(1, 0, 2))
 
             att_t = F.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t], 1)))
             att_t = self.dropout(att_t)
@@ -351,8 +351,8 @@ class NMT(nn.Module):
 
         src_encoding = src_encoding.repeat(1, sample_size, 1)
         src_encoding_att_linear = tensor_transform(self.att_src_linear, src_encoding)
-        src_encoding = src_encoding.t()
-        src_encoding_att_linear = src_encoding_att_linear.t()
+        src_encoding = src_encoding.permute(1, 0, 2)
+        src_encoding_att_linear = src_encoding_att_linear.permute(1, 0, 2)
 
         new_tensor = dec_init_state.data.new
         att_tm1 = Variable(new_tensor(batch_size, self.args.hidden_size).zero_(), volatile=True)
