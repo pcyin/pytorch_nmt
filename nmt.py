@@ -773,13 +773,13 @@ def get_acc(references, hypotheses, acc_type='word'):
     assert acc_type == 'word_acc' or acc_type == 'sent_acc'
     cum_acc = 0.
 
-    for ref, hyp in zip(references, hypotheses):
-        ref = ref[1:-1]
+    for refs, hyp in zip(references, hypotheses):
+        refs = [ref[1:-1] for ref in refs]
         hyp = hyp[1:-1]
         if acc_type == 'word_acc':
-            acc = len([1 for ref_w, hyp_w in zip(ref, hyp) if ref_w == hyp_w]) / float(len(hyp) + 1e-6)
+            acc = max(len([1 for ref_w, hyp_w in zip(ref, hyp) if ref_w == hyp_w]) / float(len(hyp) + 1e-6) for ref in refs)
         else:
-            acc = 1. if all(ref_w == hyp_w for ref_w, hyp_w in zip(ref, hyp)) else 0.
+            acc = 1. if max(all(ref_w == hyp_w for ref_w, hyp_w in zip(ref, hyp)) for ref in refs) else 0.
         cum_acc += acc
 
     acc = cum_acc / len(hypotheses)
@@ -875,9 +875,7 @@ def compute_lm_prob(args):
 
 
 def test(args):
-    test_data_src = read_corpus(args.test_src, source='src')
-    test_data_tgt = read_corpus(args.test_tgt, source='tgt')
-    test_data = zip(test_data_src, test_data_tgt)
+    dataset = Dataset(args.data_folder)
 
     if args.load_model:
         print('load model from [%s]' % args.load_model, file=sys.stderr)
@@ -897,12 +895,12 @@ def test(args):
     if args.cuda:
         model = model.cuda()
 
-    hypotheses = decode(model, test_data)
+    hypotheses = decode(model, dataset.test_examples())
     top_hypotheses = [hyps[0] for hyps in hypotheses]
 
-    bleu_score = get_bleu([tgt for src, tgt in test_data], top_hypotheses)
-    word_acc = get_acc([tgt for src, tgt in test_data], top_hypotheses, 'word_acc')
-    sent_acc = get_acc([tgt for src, tgt in test_data], top_hypotheses, 'sent_acc')
+    bleu_score = get_bleu([tgt for src, tgt in dataset.test_examples()], top_hypotheses)
+    word_acc = get_acc([tgt for src, tgt in dataset.test_examples()], top_hypotheses, 'word_acc')
+    sent_acc = get_acc([tgt for src, tgt in dataset.test_examples()], top_hypotheses, 'sent_acc')
     print('Corpus Level BLEU: %f, word level acc: %f, sentence level acc: %f' % (bleu_score, word_acc, sent_acc),
           file=sys.stderr)
 
@@ -911,18 +909,6 @@ def test(args):
         with open(args.save_to_file, 'w') as f:
             for hyps in hypotheses:
                 f.write(' '.join(hyps[0][1:-1]) + '\n')
-
-        if args.save_nbest:
-            nbest_file = args.save_to_file + '.nbest'
-            print('save nbest decoding results to %s' % nbest_file, file=sys.stderr)
-            with open(nbest_file, 'w') as f:
-                for src_sent, tgt_sent, hyps in zip(test_data_src, test_data_tgt, hypotheses):
-                    print('Source: %s' % ' '.join(src_sent), file=f)
-                    print('Target: %s' % ' '.join(tgt_sent), file=f)
-                    print('Hypotheses:', file=f)
-                    for i, hyp in enumerate(hyps, 1):
-                        print('[%d] %s' % (i, ' '.join(hyp)), file=f)
-                    print('*' * 30, file=f)
 
 
 def interactive(args):
