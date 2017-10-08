@@ -57,7 +57,8 @@ class Dataset(object):
             exg_iter = self.test_examples(shuffle=shuffle)
         examples_buffer = []
 
-        while True:
+        last = False
+        while not last:
             print('loading data to buffer ...', file=sys.stderr)
             begin_time = time.time()
             for i in xrange(self.buffer_size):
@@ -65,6 +66,7 @@ class Dataset(object):
                     item = next(exg_iter)
                     examples_buffer.append(item)
                 except StopIteration:
+                    last = True
                     break
             print('loading data to buffer done, took %ds' % (time.time() - begin_time), file=sys.stderr)
 
