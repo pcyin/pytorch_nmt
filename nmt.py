@@ -42,7 +42,7 @@ def init_config():
 
     parser.add_argument('--data_folder', type=str, help='path to the data folder')
 
-    parser.add_argument('--decode_max_time_step', default=50, type=int, help='maximum number of time steps used '
+    parser.add_argument('--decode_max_time_step', default=250, type=int, help='maximum number of time steps used '
                                                                               'in decoding and sampling')
 
     parser.add_argument('--valid_niter', default=500, type=int, help='every n iterations to perform validation')
@@ -541,7 +541,7 @@ def train_raml(args):
         print('done[%d s].' % (time.time() - begin_time))
     elif args.raml_sample_mode.startswith('hamming_distance'):
         print('sample from hamming distance payoff distribution')
-        payoff_prob, Z_qs = generate_hamming_distance_payoff_distribution(max_sent_len=50,
+        payoff_prob, Z_qs = generate_hamming_distance_payoff_distribution(max_sent_len=args.decode_max_time_step,
                                                                           vocab_size=len(vocab) - 3,
                                                                           tau=tau)
 
