@@ -49,3 +49,10 @@ def data_iter(data, batch_size, shuffle=True):
         np.random.shuffle(batched_data)
     for batch in batched_data:
         yield batch
+
+
+def hamming_distance(ref_sent, hyp_sent):
+    if len(ref_sent) != len(hyp_sent):
+        return 100
+
+    return sum(1. if ref_token != hyp_token else 0. for (ref_token, hyp_token) in zip(ref_sent, hyp_sent))

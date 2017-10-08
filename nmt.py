@@ -18,8 +18,9 @@ from collections import defaultdict, Counter, namedtuple
 from itertools import chain, islice
 import argparse, os, sys
 
-from util import read_corpus, data_iter, batch_slice
-from vocab import Vocab, VocabEntry
+from dataset import Dataset
+from util import read_corpus, data_iter, batch_slice, hamming_distance
+from vocab import VocabEntry
 from process_samples import generate_hamming_distance_payoff_distribution
 import math
 
@@ -34,18 +35,14 @@ def init_config():
     parser.add_argument('--batch_size', default=32, type=int, help='batch size')
     parser.add_argument('--beam_size', default=5, type=int, help='beam size for beam search')
     parser.add_argument('--sample_size', default=10, type=int, help='sample size')
+    parser.add_argument('--raw_image_size', default=4096)
     parser.add_argument('--embed_size', default=256, type=int, help='size of word embeddings')
     parser.add_argument('--hidden_size', default=256, type=int, help='size of LSTM hidden states')
     parser.add_argument('--dropout', default=0., type=float, help='dropout rate')
 
-    parser.add_argument('--train_src', type=str, help='path to the training source file')
-    parser.add_argument('--train_tgt', type=str, help='path to the training target file')
-    parser.add_argument('--dev_src', type=str, help='path to the dev source file')
-    parser.add_argument('--dev_tgt', type=str, help='path to the dev target file')
-    parser.add_argument('--test_src', type=str, help='path to the test source file')
-    parser.add_argument('--test_tgt', type=str, help='path to the test target file')
+    parser.add_argument('--data_folder', type=str, help='path to the data folder')
 
-    parser.add_argument('--decode_max_time_step', default=200, type=int, help='maximum number of time steps used '
+    parser.add_argument('--decode_max_time_step', default=50, type=int, help='maximum number of time steps used '
                                                                               'in decoding and sampling')
 
     parser.add_argument('--valid_niter', default=500, type=int, help='every n iterations to perform validation')
@@ -108,11 +105,6 @@ def word2id(sents, vocab):
         return [vocab[w] for w in sents]
 
 
-def tensor_transform(linear, X):
-    # X is a 3D tensor
-    return linear(X.contiguous().view(-1, X.size(2))).view(X.size(0), X.size(1), -1)
-
-
 class NMT(nn.Module):
     def __init__(self, args, vocab):
         super(NMT, self).__init__()
@@ -121,22 +113,17 @@ class NMT(nn.Module):
 
         self.vocab = vocab
 
-        self.src_embed = nn.Embedding(len(vocab.src), args.embed_size, padding_idx=vocab.src['<pad>'])
-        self.tgt_embed = nn.Embedding(len(vocab.tgt), args.embed_size, padding_idx=vocab.tgt['<pad>'])
+        self.tgt_embed = nn.Embedding(len(vocab), args.embed_size, padding_idx=vocab['<pad>'])
 
-        self.encoder_lstm = nn.LSTM(args.embed_size, args.hidden_size, bidirectional=True, dropout=args.dropout)
+        self.image_encoding_linear = nn.Linear(args.raw_image_size, args.hidden_size, bias=True)
         self.decoder_lstm = nn.LSTMCell(args.embed_size + args.hidden_size, args.hidden_size)
-
-        # attention: dot product attention
-        # project source encoding to decoder rnn's h space
-        self.att_src_linear = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
 
         # transformation of decoder hidden states and context vectors before reading out target words
         # this produces the `attentional vector` in (Luong et al., 2015)
-        self.att_vec_linear = nn.Linear(args.hidden_size * 2 + args.hidden_size, args.hidden_size, bias=False)
+        self.att_vec_linear = nn.Linear(args.hidden_size + args.hidden_size, args.hidden_size, bias=False)
 
         # prediction layer of the target vocabulary
-        self.readout = nn.Linear(args.hidden_size, len(vocab.tgt), bias=False)
+        self.readout = nn.Linear(args.hidden_size, len(vocab), bias=False)
 
         # dropout layer
         self.dropout = nn.Dropout(args.dropout)
@@ -144,51 +131,37 @@ class NMT(nn.Module):
         # initialize the decoder's state and cells with encoder hidden states
         self.decoder_cell_init = nn.Linear(args.hidden_size * 2, args.hidden_size)
 
-    def forward(self, src_sents, src_sents_len, tgt_words):
-        src_encodings, init_ctx_vec = self.encode(src_sents, src_sents_len)
-        scores = self.decode(src_encodings, init_ctx_vec, tgt_words)
+    def forward(self, src_images, tgt_sents):
+        src_encodings = self.encode(src_images)
+        scores = self.decode(src_encodings, tgt_sents)
 
         return scores
 
-    def encode(self, src_sents, src_sents_len):
+    def encode(self, src_images):
         """
-        :param src_sents: (src_sent_len, batch_size), sorted by the length of the source
-        :param src_sents_len: (src_sent_len)
+        :param src_images: (batch_size, image_encoding_size), sorted by the length of the source
         """
-        # (src_sent_len, batch_size, embed_size)
-        src_word_embed = self.src_embed(src_sents)
-        packed_src_embed = pack_padded_sequence(src_word_embed, src_sents_len)
+        src_images_encoding = self.image_encoding_linear(src_images)
 
-        # output: (src_sent_len, batch_size, hidden_size)
-        output, (last_state, last_cell) = self.encoder_lstm(packed_src_embed)
-        output, _ = pad_packed_sequence(output)
+        return src_images_encoding
 
-        dec_init_cell = self.decoder_cell_init(torch.cat([last_cell[0], last_cell[1]], 1))
-        dec_init_state = F.tanh(dec_init_cell)
-
-        return output, (dec_init_state, dec_init_cell)
-
-    def decode(self, src_encoding, dec_init_vec, tgt_sents):
+    def decode(self, src_images_encoding, tgt_sents):
         """
-        :param src_encoding: (src_sent_len, batch_size, hidden_size)
-        :param dec_init_vec: (batch_size, hidden_size)
+        :param src_images_encoding: (batch_size, image_encoding_size)
         :param tgt_sents: (tgt_sent_len, batch_size)
         :return:
         """
-        init_state = dec_init_vec[0]
-        init_cell = dec_init_vec[1]
+        init_state = F.tanh(src_images_encoding)
+        init_cell = src_images_encoding
         hidden = (init_state, init_cell)
 
         new_tensor = init_cell.data.new
-        batch_size = src_encoding.size(1)
+        batch_size = src_images_encoding.size(0)
 
-        # (batch_size, src_sent_len, hidden_size * 2)
-        src_encoding = src_encoding.permute(1, 0, 2)
-        # (batch_size, src_sent_len, hidden_size)
-        src_encoding_att_linear = tensor_transform(self.att_src_linear, src_encoding)
         # initialize attentional vector
         att_tm1 = Variable(new_tensor(batch_size, self.args.hidden_size).zero_(), requires_grad=False)
 
+        # (tgt_sent_len, batch_size, embed_size)
         tgt_word_embed = self.tgt_embed(tgt_sents)
         scores = []
 
@@ -201,7 +174,8 @@ class NMT(nn.Module):
             h_t, cell_t = self.decoder_lstm(x, hidden)
             h_t = self.dropout(h_t)
 
-            ctx_t, alpha_t = self.dot_prod_attention(h_t, src_encoding, src_encoding_att_linear)
+            # no attention!
+            ctx_t = src_images_encoding
 
             att_t = F.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t], 1)))   # E.q. (5)
             att_t = self.dropout(att_t)
@@ -215,23 +189,22 @@ class NMT(nn.Module):
         scores = torch.stack(scores)
         return scores
 
-    def translate(self, src_sents, beam_size=None, to_word=True):
+    def translate(self, src_images, beam_size=None, to_word=True):
         """
         perform beam search
         TODO: batched beam search
         """
-        if not type(src_sents[0]) == list:
-            src_sents = [src_sents]
+        if len(src_images.size()) == 1:
+            src_images = src_images.unsqueeze(0)
         if not beam_size:
             beam_size = args.beam_size
 
-        src_sents_var = to_input_variable(src_sents, self.vocab.src, cuda=args.cuda, is_test=True)
+        src_images_var = image_to_input_variable(src_images, cuda=args.cuda, is_test=True)
 
-        src_encoding, dec_init_vec = self.encode(src_sents_var, [len(src_sents[0])])
-        src_encoding_att_linear = tensor_transform(self.att_src_linear, src_encoding)
+        src_images_encoding = self.encode(src_images_var)
 
-        init_state = dec_init_vec[0]
-        init_cell = dec_init_vec[1]
+        init_state = F.tanh(src_images_encoding)
+        init_cell = src_images_encoding
         hidden = (init_state, init_cell)
 
         att_tm1 = Variable(torch.zeros(1, self.args.hidden_size), volatile=True)
@@ -240,9 +213,9 @@ class NMT(nn.Module):
             att_tm1 = att_tm1.cuda()
             hyp_scores = hyp_scores.cuda()
 
-        eos_id = self.vocab.tgt['</s>']
-        bos_id = self.vocab.tgt['<s>']
-        tgt_vocab_size = len(self.vocab.tgt)
+        eos_id = self.vocab['</s>']
+        bos_id = self.vocab['<s>']
+        tgt_vocab_size = len(self.vocab)
 
         hypotheses = [[bos_id]]
         completed_hypotheses = []
@@ -253,8 +226,8 @@ class NMT(nn.Module):
             t += 1
             hyp_num = len(hypotheses)
 
-            expanded_src_encoding = src_encoding.expand(src_encoding.size(0), hyp_num, src_encoding.size(2))
-            expanded_src_encoding_att_linear = src_encoding_att_linear.expand(src_encoding_att_linear.size(0), hyp_num, src_encoding_att_linear.size(2))
+            # (hyp_num, encoding_size)
+            expanded_src_encoding = src_images_encoding.expand(hyp_num, src_images_encoding.size(1))
 
             y_tm1 = Variable(torch.LongTensor([hyp[-1] for hyp in hypotheses]), volatile=True)
             if args.cuda:
@@ -268,7 +241,7 @@ class NMT(nn.Module):
             h_t, cell_t = self.decoder_lstm(x, hidden)
             h_t = self.dropout(h_t)
 
-            ctx_t, alpha_t = self.dot_prod_attention(h_t, expanded_src_encoding.permute(1, 0, 2), expanded_src_encoding_att_linear.permute(1, 0, 2))
+            ctx_t = expanded_src_encoding
 
             att_t = F.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t], 1)))
             att_t = self.dropout(att_t)
@@ -318,144 +291,11 @@ class NMT(nn.Module):
 
         if to_word:
             for i, hyp in enumerate(completed_hypotheses):
-                completed_hypotheses[i] = [self.vocab.tgt.id2word[w] for w in hyp]
+                completed_hypotheses[i] = [self.vocab.id2word[w] for w in hyp]
 
         ranked_hypotheses = sorted(zip(completed_hypotheses, completed_hypothesis_scores), key=lambda x: x[1], reverse=True)
 
         return [hyp for hyp, score in ranked_hypotheses]
-
-    def sample(self, src_sents, sample_size=None, to_word=False):
-        if not type(src_sents[0]) == list:
-            src_sents = [src_sents]
-        if not sample_size:
-            sample_size = args.sample_size
-
-        src_sents_num = len(src_sents)
-        batch_size = src_sents_num * sample_size
-
-        src_sents_var = to_input_variable(src_sents, self.vocab.src, cuda=args.cuda, is_test=True)
-        src_encoding, (dec_init_state, dec_init_cell) = self.encode(src_sents_var, [len(s) for s in src_sents])
-
-        dec_init_state = dec_init_state.repeat(sample_size, 1)
-        dec_init_cell = dec_init_cell.repeat(sample_size, 1)
-        hidden = (dec_init_state, dec_init_cell)
-
-        # tile everything
-        # if args.sample_method == 'expand':
-        #     # src_enc: (src_sent_len, sample_size, enc_size)
-        #     # cat result: (src_sent_len, batch_size * sample_size, enc_size)
-        #     src_encoding = torch.cat([src_enc.expand(src_enc.size(0), sample_size, src_enc.size(2)) for src_enc in src_encoding.split(1, dim=1)], 1)
-        #     dec_init_state = torch.cat([x.expand(sample_size, x.size(1)) for x in dec_init_state.split(1, dim=0)], 0)
-        #     dec_init_cell = torch.cat([x.expand(sample_size, x.size(1)) for x in dec_init_cell.split(1, dim=0)], 0)
-        # elif args.sample_method == 'repeat':
-
-        src_encoding = src_encoding.repeat(1, sample_size, 1)
-        src_encoding_att_linear = tensor_transform(self.att_src_linear, src_encoding)
-        src_encoding = src_encoding.permute(1, 0, 2)
-        src_encoding_att_linear = src_encoding_att_linear.permute(1, 0, 2)
-
-        new_tensor = dec_init_state.data.new
-        att_tm1 = Variable(new_tensor(batch_size, self.args.hidden_size).zero_(), volatile=True)
-        y_0 = Variable(torch.LongTensor([self.vocab.tgt['<s>'] for _ in xrange(batch_size)]), volatile=True)
-
-        eos = self.vocab.tgt['</s>']
-        # eos_batch = torch.LongTensor([eos] * batch_size)
-        sample_ends = torch.ByteTensor([0] * batch_size)
-        all_ones = torch.ByteTensor([1] * batch_size)
-        if args.cuda:
-            y_0 = y_0.cuda()
-            sample_ends = sample_ends.cuda()
-            all_ones = all_ones.cuda()
-
-        samples = [y_0]
-
-        t = 0
-        while t < args.decode_max_time_step:
-            t += 1
-
-            # (sample_size)
-            y_tm1 = samples[-1]
-
-            y_tm1_embed = self.tgt_embed(y_tm1)
-
-            x = torch.cat([y_tm1_embed, att_tm1], 1)
-
-            # h_t: (batch_size, hidden_size)
-            h_t, cell_t = self.decoder_lstm(x, hidden)
-            h_t = self.dropout(h_t)
-
-            ctx_t, alpha_t = self.dot_prod_attention(h_t, src_encoding, src_encoding_att_linear)
-
-            att_t = F.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t], 1)))  # E.q. (5)
-            att_t = self.dropout(att_t)
-
-            score_t = self.readout(att_t)  # E.q. (6)
-            p_t = F.softmax(score_t)
-
-            if args.sample_method == 'random':
-                y_t = torch.multinomial(p_t, num_samples=1).squeeze(1)
-            elif args.sample_method == 'greedy':
-                _, y_t = torch.topk(p_t, k=1, dim=1)
-                y_t = y_t.squeeze(1)
-
-            samples.append(y_t)
-
-            sample_ends |= torch.eq(y_t, eos).byte().data
-            if torch.equal(sample_ends, all_ones):
-                break
-
-            # if torch.equal(y_t.data, eos_batch):
-            #     break
-
-            att_tm1 = att_t
-            hidden = h_t, cell_t
-
-        # post-processing
-        completed_samples = [list([list() for _ in xrange(sample_size)]) for _ in xrange(src_sents_num)]
-        for y_t in samples:
-            for i, sampled_word in enumerate(y_t.cpu().data):
-                src_sent_id = i % src_sents_num
-                sample_id = i / src_sents_num
-                if len(completed_samples[src_sent_id][sample_id]) == 0 or completed_samples[src_sent_id][sample_id][-1] != eos:
-                    completed_samples[src_sent_id][sample_id].append(sampled_word)
-
-        if to_word:
-            for i, src_sent_samples in enumerate(completed_samples):
-                completed_samples[i] = word2id(src_sent_samples, self.vocab.tgt.id2word)
-
-        return completed_samples
-
-    def attention(self, h_t, src_encoding, src_linear_for_att):
-        # (1, batch_size, attention_size) + (src_sent_len, batch_size, attention_size) =>
-        # (src_sent_len, batch_size, attention_size)
-        att_hidden = F.tanh(self.att_h_linear(h_t).unsqueeze(0).expand_as(src_linear_for_att) + src_linear_for_att)
-
-        # (batch_size, src_sent_len)
-        att_weights = F.softmax(tensor_transform(self.att_vec_linear, att_hidden).squeeze(2).permute(1, 0))
-
-        # (batch_size, hidden_size * 2)
-        ctx_vec = torch.bmm(src_encoding.permute(1, 2, 0), att_weights.unsqueeze(2)).squeeze(2)
-
-        return ctx_vec, att_weights
-
-    def dot_prod_attention(self, h_t, src_encoding, src_encoding_att_linear, mask=None):
-        """
-        :param h_t: (batch_size, hidden_size)
-        :param src_encoding: (batch_size, src_sent_len, hidden_size * 2)
-        :param src_encoding_att_linear: (batch_size, src_sent_len, hidden_size)
-        :param mask: (batch_size, src_sent_len)
-        """
-        # (batch_size, src_sent_len)
-        att_weight = torch.bmm(src_encoding_att_linear, h_t.unsqueeze(2)).squeeze(2)
-        if mask:
-            att_weight.data.masked_fill_(mask, -float('inf'))
-        att_weight = F.softmax(att_weight)
-
-        att_view = (att_weight.size(0), 1, att_weight.size(1))
-        # (batch_size, hidden_size)
-        ctx_vec = torch.bmm(att_weight.view(*att_view), src_encoding).squeeze(1)
-
-        return ctx_vec, att_weight
 
     def save(self, path):
         print('save parameters to [%s]' % path, file=sys.stderr)
@@ -467,7 +307,7 @@ class NMT(nn.Module):
         torch.save(params, path)
 
 
-def to_input_variable(sents, vocab, cuda=False, is_test=False):
+def sent_to_input_variable(sents, vocab, cuda=False, is_test=False):
     """
     return a tensor of shape (src_sent_len, batch_size)
     """
@@ -482,26 +322,15 @@ def to_input_variable(sents, vocab, cuda=False, is_test=False):
     return sents_var
 
 
-def evaluate_loss(model, data, crit):
-    model.eval()
-    cum_loss = 0.
-    cum_tgt_words = 0.
-    for src_sents, tgt_sents in data_iter(data, batch_size=args.batch_size, shuffle=False):
-        pred_tgt_word_num = sum(len(s[1:]) for s in tgt_sents) # omitting leading `<s>`
-        src_sents_len = [len(s) for s in src_sents]
-
-        src_sents_var = to_input_variable(src_sents, model.vocab.src, cuda=args.cuda, is_test=True)
-        tgt_sents_var = to_input_variable(tgt_sents, model.vocab.tgt, cuda=args.cuda, is_test=True)
-
-        # (tgt_sent_len, batch_size, tgt_vocab_size)
-        scores = model(src_sents_var, src_sents_len, tgt_sents_var[:-1])
-        loss = crit(scores.view(-1, scores.size(2)), tgt_sents_var[1:].view(-1))
-
-        cum_loss += loss.data[0]
-        cum_tgt_words += pred_tgt_word_num
-
-    loss = cum_loss / cum_tgt_words
-    return loss
+def image_to_input_variable(image, cuda=False, is_test=False):
+    if isinstance(image, np.ndarray):
+        image = torch.from_numpy(image)
+    elif isinstance(image, list):
+        image = torch.stack(image)
+    if cuda:
+        return Variable(image.cuda(), volatile=is_test, requires_grad=False)
+    else:
+        return Variable(image, volatile=is_test, requires_grad=False)
 
 
 def init_training(args):
@@ -515,8 +344,8 @@ def init_training(args):
         for p in model.parameters():
             p.data.uniform_(-args.uniform_init, args.uniform_init)
 
-    vocab_mask = torch.ones(len(vocab.tgt))
-    vocab_mask[vocab.tgt['<pad>']] = 0
+    vocab_mask = torch.ones(len(vocab))
+    vocab_mask[vocab['<pad>']] = 0
     nll_loss = nn.NLLLoss(weight=vocab_mask, size_average=False)
     cross_entropy_loss = nn.CrossEntropyLoss(weight=vocab_mask, size_average=False)
 
@@ -553,8 +382,8 @@ def train(args):
         for src_sents, tgt_sents in data_iter(train_data, batch_size=args.batch_size):
             train_iter += 1
 
-            src_sents_var = to_input_variable(src_sents, vocab.src, cuda=args.cuda)
-            tgt_sents_var = to_input_variable(tgt_sents, vocab.tgt, cuda=args.cuda)
+            src_sents_var = sent_to_input_variable(src_sents, vocab.src, cuda=args.cuda)
+            tgt_sents_var = sent_to_input_variable(tgt_sents, vocab.tgt, cuda=args.cuda)
 
             batch_size = len(src_sents)
             src_sents_len = [len(s) for s in src_sents]
@@ -700,13 +529,7 @@ def read_raml_train_data(data_file, temp):
 def train_raml(args):
     tau = args.temp
 
-    train_data_src = read_corpus(args.train_src, source='src')
-    train_data_tgt = read_corpus(args.train_tgt, source='tgt')
-    train_data = zip(train_data_src, train_data_tgt)
-
-    dev_data_src = read_corpus(args.dev_src, source='src')
-    dev_data_tgt = read_corpus(args.dev_tgt, source='tgt')
-    dev_data = zip(dev_data_src, dev_data_tgt)
+    dataset = Dataset(args.data_folder)
 
     vocab, model, optimizer, nll_loss, cross_entropy_loss = init_training(args)
 
@@ -718,8 +541,8 @@ def train_raml(args):
         print('done[%d s].' % (time.time() - begin_time))
     elif args.raml_sample_mode.startswith('hamming_distance'):
         print('sample from hamming distance payoff distribution')
-        payoff_prob, Z_qs = generate_hamming_distance_payoff_distribution(max(len(sent) for sent in train_data_tgt),
-                                                                          vocab_size=len(vocab.tgt) - 3,
+        payoff_prob, Z_qs = generate_hamming_distance_payoff_distribution(max_sent_len=50,
+                                                                          vocab_size=len(vocab) - 3,
                                                                           tau=tau)
 
     train_iter = patience = cum_loss = report_loss = cum_tgt_words = report_tgt_words = 0
@@ -736,96 +559,109 @@ def train_raml(args):
 
     while True:
         epoch += 1
-        for src_sents, tgt_sents in data_iter(train_data, batch_size=args.batch_size):
+        for batch_examples in dataset.batch_iter('train', batch_size=args.batch_size, shuffle=True):
             train_iter += 1
 
-            raml_src_sents = []
+            raml_src_images = []
             raml_tgt_sents = []
             raml_tgt_weights = []
 
             if args.raml_sample_mode == 'pre_sample':
-                for src_sent in src_sents:
-                    tgt_samples_all = raml_samples[' '.join(src_sent)]
-
-                    if args.sample_size >= len(tgt_samples_all):
-                        tgt_samples = tgt_samples_all
-                    else:
-                        tgt_samples_id = np.random.choice(range(1, len(tgt_samples_all)), size=args.sample_size - 1, replace=False)
-                        tgt_samples = [tgt_samples_all[0]] + [tgt_samples_all[i] for i in tgt_samples_id] # make sure the ground truth y* is in the samples
-
-                    raml_src_sents.extend([src_sent] * len(tgt_samples))
-                    raml_tgt_sents.extend([['<s>'] + sent.split(' ') + ['</s>'] for sent, weight in tgt_samples])
-                    raml_tgt_weights.extend([weight for sent, weight in tgt_samples])
+                raise NotImplementedError()
             elif args.raml_sample_mode in ['hamming_distance', 'hamming_distance_impt_sample']:
-                for src_sent, tgt_sent in zip(src_sents, tgt_sents):
+                for src_image, tgt_sents in batch_examples:
                     tgt_samples = []  # make sure the ground truth y* is in the samples
-                    tgt_sent_len = len(tgt_sent) - 3 # remove <s> and </s> and ending period .
-                    tgt_ref_tokens = tgt_sent[1:-1]
-                    bleu_scores = []
-                    # print('y*: %s' % ' '.join(tgt_sent))
-                    # sample an edit distances
-                    e_samples = np.random.choice(range(tgt_sent_len + 1), p=payoff_prob[tgt_sent_len], size=args.sample_size, replace=True)
+                    references = [_tgt_sent[1:-1] for _tgt_sent in tgt_sents]  # remove <s> and </s>
+                    tgt_sample_weights = []
 
-                    # make sure the ground truth y* is in the samples
-                    if args.raml_bias_groundtruth and (not 0 in e_samples):
-                        e_samples[0] = 0
+                    # now we have multiple samples, we use ancestral sampling
+                    tgt_sent_lens = [len(_tgt_sent) - 2 for _tgt_sent in tgt_sents]  # remove <s> and </s> # TODO: check if period in target!
+                    tgt_sents_num = len(tgt_sents)
+                    min_tgt_sent_len = min(tgt_sent_lens)
 
-                    for i, e in enumerate(e_samples):
+                    tgt_dist_samples = []
+                    # make sure the ground truth {y*}'s are in the samples
+                    if args.raml_bias_groundtruth:
+                        for tgt_id in xrange(tgt_sents_num):
+                            tgt_dist_samples.append((tgt_id, 0))
+
+                    sample_size = args.sample_size - len(tgt_dist_samples)
+                    if sample_size > 0:
+                        tgt_sent_id_samples = np.random.choice(range(tgt_sents_num), size=sample_size, replace=True)
+                        e_samples = np.random.choice(range(min_tgt_sent_len + 1), p=payoff_prob[min_tgt_sent_len],
+                                                     size=sample_size, replace=True)
+                        tgt_dist_samples += zip(tgt_sent_id_samples, e_samples)
+
+                    for sample_id, (tgt_sent_id, e) in enumerate(tgt_dist_samples):
+                        tgt_sent = tgt_sents[tgt_sent_id]
                         if e > 0:
                             # sample a new tgt_sent $y$
+                            tgt_sent_len = tgt_sent_lens[tgt_sent_id]
                             old_word_pos = np.random.choice(range(1, tgt_sent_len + 1), size=e, replace=False)
-                            new_words = [vocab.tgt.id2word[wid] for wid in np.random.randint(3, len(vocab.tgt), size=e)]
-                            new_tgt_sent = list(tgt_sent)
+                            new_words = [vocab.id2word[wid] for wid in np.random.randint(3, len(vocab), size=e)]
+                            sampled_tgt_sent = list(tgt_sent)
                             for pos, word in zip(old_word_pos, new_words):
-                                new_tgt_sent[pos] = word
+                                sampled_tgt_sent[pos] = word
                         else:
-                            new_tgt_sent = list(tgt_sent)
+                            sampled_tgt_sent = list(tgt_sent)
 
-                        # if enable importance sampling, compute bleu score
+                        # print('y: %s' % ' '.join(sampled_tgt_sent))
+                        tgt_samples.append((sampled_tgt_sent, tgt_sent_id))
+
+                        # if enable importance sampling, compute unnormalized q-distribution value: \tilde{q}(y|{y*})
                         if args.raml_sample_mode == 'hamming_distance_impt_sample':
-                            if e > 0:
-                                # remove <s> and </s>
-                                bleu_score = sentence_bleu([tgt_ref_tokens], new_tgt_sent[1:-1], smoothing_function=sm_func)
-                                bleu_scores.append(bleu_score)
-                            else:
-                                bleu_scores.append(1.)
+                            bleu_scores = [1. if (e == 0 and _i == tgt_sent_id)
+                                           else sentence_bleu([references[_i]],
+                                                              sampled_tgt_sent[1: -1],
+                                                              smoothing_function=sm_func)
+                                           for _i in xrange(tgt_sents_num)]
+                            q_tilde = math.exp((1. / tgt_sents_num) * sum(bleu_scores) / tau)
 
-                        # print('y: %s' % ' '.join(new_tgt_sent))
-                        tgt_samples.append(new_tgt_sent)
+                            mixture_probs = []
+                            for _i in xrange(tgt_sents_num):
+                                if e == 0 and _i == tgt_sent_id: p = 1. / tgt_sents_num
+                                else:
+                                    ref_sent = references[_i]
+                                    hm = hamming_distance(ref_sent, sampled_tgt_sent[1:-1])
+                                    Z = Z_qs[len(ref_sent)]
+                                    p = 1. / tgt_sents_num * math.exp(-hm / tau) / Z
+                                mixture_probs.append(p)
+                            propose_dist_tilde = sum(mixture_probs)
 
-                    # if enable importance sampling, compute importance weight
+                            importance_weight = q_tilde / propose_dist_tilde
+                            tgt_sample_weights.append(importance_weight)
+                        else:
+                            tgt_sample_weights.append(1.)
+
+                    # normalize importance sampling weights
                     if args.raml_sample_mode == 'hamming_distance_impt_sample':
-                        tgt_sample_weights = [math.exp(bleu_score / tau) / math.exp(-e / tau) for e, bleu_score in zip(e_samples, bleu_scores)]
                         normalizer = sum(tgt_sample_weights)
                         tgt_sample_weights = [w / normalizer for w in tgt_sample_weights]
-                    else:
-                        tgt_sample_weights = [1.] * args.sample_size
 
-                    raml_src_sents.extend([src_sent] * len(tgt_samples))
-                    raml_tgt_sents.extend(tgt_samples)
+                    raml_src_images.extend([src_image] * len(tgt_samples))
+                    raml_tgt_sents.extend([sample for sample, ref_sent_id in tgt_samples])
                     raml_tgt_weights.extend(tgt_sample_weights)
 
-            src_sents_var = to_input_variable(raml_src_sents, vocab.src, cuda=args.cuda)
-            tgt_sents_var = to_input_variable(raml_tgt_sents, vocab.tgt, cuda=args.cuda)
+            src_images_var = image_to_input_variable(raml_src_images, cuda=args.cuda)
+            tgt_sents_var = sent_to_input_variable(raml_tgt_sents, vocab, cuda=args.cuda)
             weights_var = Variable(torch.FloatTensor(raml_tgt_weights), requires_grad=False)
             if args.cuda:
                 weights_var = weights_var.cuda()
 
-            batch_size = len(raml_src_sents)  # batch_size = args.batch_size * args.sample_size
-            src_sents_len = [len(s) for s in raml_src_sents]
+            batch_size = len(raml_src_images)  # batch_size = args.batch_size * args.sample_size
             pred_tgt_word_num = sum(len(s[1:]) for s in raml_tgt_sents)  # omitting leading `<s>`
             optimizer.zero_grad()
 
             # (tgt_sent_len, batch_size, tgt_vocab_size)
-            scores = model(src_sents_var, src_sents_len, tgt_sents_var[:-1])
+            scores = model(src_images_var, tgt_sents_var[:-1])
             # (tgt_sent_len * batch_size, tgt_vocab_size)
             log_scores = F.log_softmax(scores.view(-1, scores.size(2)))
             # remove leading <s> in tgt sent, which is not used as the target
             flattened_tgt_sents = tgt_sents_var[1:].view(-1)
 
             # batch_size * tgt_sent_len
-            tgt_log_scores = torch.gather(log_scores, 1, flattened_tgt_sents.unsqueeze(1)).squeeze(1)
-            unweighted_loss = -tgt_log_scores * (1. - torch.eq(flattened_tgt_sents, 0).float())
+            tgt_log_scores = torch.gather(log_scores, dim=1, index=flattened_tgt_sents.unsqueeze(1)).squeeze(1)
+            unweighted_loss = -tgt_log_scores * (1. - torch.eq(flattened_tgt_sents, 0).float())  # apply mask
             weighted_loss = unweighted_loss * weights_var.repeat(scores.size(0))
             weighted_loss = weighted_loss.sum()
             weighted_loss_val = weighted_loss.data[0]
@@ -881,24 +717,14 @@ def train_raml(args):
                 model.eval()
 
                 # compute dev. ppl and bleu
-
-                dev_loss = evaluate_loss(model, dev_data, cross_entropy_loss)
-                dev_ppl = np.exp(dev_loss)
-
-                if args.valid_metric in ['bleu', 'word_acc', 'sent_acc']:
-                    dev_hyps = decode(model, dev_data)
-                    dev_hyps = [hyps[0] for hyps in dev_hyps]
-                    if args.valid_metric == 'bleu':
-                        valid_metric = get_bleu([tgt for src, tgt in dev_data], dev_hyps)
-                    else:
-                        valid_metric = get_acc([tgt for src, tgt in dev_data], dev_hyps, acc_type=args.valid_metric)
-                    print('validation: iter %d, dev. ppl %f, dev. %s %f' % (
-                    train_iter, dev_ppl, args.valid_metric, valid_metric),
-                          file=sys.stderr)
+                dev_hyps = decode(model, dataset.valid_examples())
+                dev_hyps = [hyps[0] for hyps in dev_hyps]
+                if args.valid_metric == 'bleu':
+                    valid_metric = get_bleu([tgt for src, tgt in dataset.valid_examples()], dev_hyps)
                 else:
-                    valid_metric = -dev_ppl
-                    print('validation: iter %d, dev. ppl %f' % (train_iter, dev_ppl),
-                          file=sys.stderr)
+                    valid_metric = get_acc([tgt for src, tgt in dataset.valid_examples()], dev_hyps, acc_type=args.valid_metric)
+                print('validation: iter %d, dev. %s %f' % (train_iter, args.valid_metric, valid_metric),
+                      file=sys.stderr)
 
                 model.train()
 
@@ -936,8 +762,9 @@ def train_raml(args):
 
 def get_bleu(references, hypotheses):
     # compute BLEU
-    bleu_score = corpus_bleu([[ref[1:-1]] for ref in references],
-                             [hyp[1:-1] for hyp in hypotheses])
+    references = [[ref[1:-1] for ref in refs] for refs in references]
+    hypotheses = [hyp[1:-1] for hyp in hypotheses]
+    bleu_score = corpus_bleu(references, hypotheses)
 
     return bleu_score
 
@@ -966,29 +793,21 @@ def decode(model, data, verbose=True):
     hypotheses = []
     begin_time = time.time()
 
-    if type(data[0]) is tuple:
-        for src_sent, tgt_sent in data:
-            hyps = model.translate(src_sent)
-            hypotheses.append(hyps)
+    example_num = 0
+    for src_image, tgt_sents in data:
+        hyps = model.translate(src_image)
+        hypotheses.append(hyps)
+        example_num += 1
 
-            if verbose:
-                print('*' * 50)
-                print('Source: ', ' '.join(src_sent))
-                print('Target: ', ' '.join(tgt_sent))
-                print('Top Hypothesis: ', ' '.join(hyps[0]))
-    else:
-        for src_sent in data:
-            hyps = model.translate(src_sent)
-            hypotheses.append(hyps)
-
-            if verbose:
-                print('*' * 50)
-                print('Source: ', ' '.join(src_sent))
-                print('Top Hypothesis: ', ' '.join(hyps[0]))
+        if verbose:
+            print('*' * 50)
+            for i, tgt_sent in enumerate(tgt_sents):
+                print('Target %d: %s' % (i, ' '.join(tgt_sent)))
+            print('Top Hypothesis: ', ' '.join(hyps[0]))
 
     elapsed = time.time() - begin_time
 
-    print('decoded %d examples, took %d s' % (len(data), elapsed), file=sys.stderr)
+    print('decoded %d examples, took %d s' % (example_num, elapsed), file=sys.stderr)
 
     return hypotheses
 
@@ -1029,8 +848,8 @@ def compute_lm_prob(args):
         pred_tgt_word_nums = [len(s[1:]) for s in tgt_sents]  # omitting leading `<s>`
 
         # (sent_len, batch_size)
-        src_sents_var = to_input_variable(src_sents, model.vocab.src, cuda=args.cuda, is_test=True)
-        tgt_sents_var = to_input_variable(tgt_sents, model.vocab.tgt, cuda=args.cuda, is_test=True)
+        src_sents_var = sent_to_input_variable(src_sents, model.vocab.src, cuda=args.cuda, is_test=True)
+        tgt_sents_var = sent_to_input_variable(tgt_sents, model.vocab.tgt, cuda=args.cuda, is_test=True)
 
         # (tgt_sent_len, batch_size, tgt_vocab_size)
         scores = model(src_sents_var, src_sents_len, tgt_sents_var[:-1])

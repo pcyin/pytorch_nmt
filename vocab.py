@@ -5,6 +5,7 @@ from itertools import chain
 
 import torch
 
+from dataset import Dataset
 from util import read_corpus
 
 
@@ -64,42 +65,20 @@ class VocabEntry(object):
         return vocab_entry
 
 
-class Vocab(object):
-    def __init__(self, src_sents, tgt_sents, src_vocab_size, tgt_vocab_size, remove_singleton=True):
-        assert len(src_sents) == len(tgt_sents)
-
-        print('initialize source vocabulary ..')
-        self.src = VocabEntry.from_corpus(src_sents, src_vocab_size, remove_singleton=remove_singleton)
-
-        print('initialize target vocabulary ..')
-        self.tgt = VocabEntry.from_corpus(tgt_sents, tgt_vocab_size, remove_singleton=remove_singleton)
-
-    def __repr__(self):
-        return 'Vocab(source %d words, target %d words)' % (len(self.src), len(self.tgt))
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--src_vocab_size', default=50000, type=int, help='source vocabulary size')
     parser.add_argument('--tgt_vocab_size', default=50000, type=int, help='target vocabulary size')
     parser.add_argument('--include_singleton', action='store_true', default=False, help='whether to include singleton'
                                                                                         'in the vocabulary (default=False)')
-
-    parser.add_argument('--train_src', type=str, required=True, help='file of source sentences')
-    parser.add_argument('--train_tgt', type=str, required=True, help='file of target sentences')
-
+    parser.add_argument('--data_folder', type=str, required=True, help='file of target sentences')
     parser.add_argument('--output', default='vocab.bin', type=str, help='output vocabulary file')
 
     args = parser.parse_args()
 
-    print('read in source sentences: %s' % args.train_src)
-    print('read in target sentences: %s' % args.train_tgt)
+    dataset = Dataset(args.data_folder)
+    all_captions = list(chain(*[caps for img, caps in dataset.train_examples()]))
 
-    src_sents = read_corpus(args.train_src, source='src')
-    tgt_sents = read_corpus(args.train_tgt, source='tgt')
-
-    vocab = Vocab(src_sents, tgt_sents, args.src_vocab_size, args.tgt_vocab_size, remove_singleton=not args.include_singleton)
-    print('generated vocabulary, source %d words, target %d words' % (len(vocab.src), len(vocab.tgt)))
+    vocab = VocabEntry.from_corpus(all_captions, args.tgt_vocab_size, remove_singleton=not args.include_singleton)
 
     torch.save(vocab, args.output)
     print('vocabulary saved to %s' % args.output)

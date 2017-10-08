@@ -8,7 +8,7 @@ import torch
 from util import read_corpus
 import numpy as np
 from scipy.misc import comb
-from vocab import Vocab, VocabEntry
+from vocab import VocabEntry
 import math
 
 
