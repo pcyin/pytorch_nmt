@@ -1,6 +1,8 @@
+from __future__ import print_function
 import cPickle as pickle
-import os
+import os, time
 import numpy as np
+import sys
 import torch
 from torch.utils.serialization import load_lua
 from collections import namedtuple
@@ -54,12 +56,15 @@ class Dataset(object):
         examples_buffer = []
 
         while True:
+            print('loading data to buffer ...', file=sys.stderr)
+            begin_time = time.time()
             for i in xrange(self.buffer_size):
                 try:
                     item = next(exg_iter)
                     examples_buffer.append(item)
                 except StopIteration:
-                    pass
+                    break
+            print('loading data to buffer done, took %ds' % (time.time() - begin_time), file=sys.stderr)
 
             batch_num = int(np.ceil(len(examples_buffer) / float(batch_size)))
             for batch_id in xrange(batch_num):
