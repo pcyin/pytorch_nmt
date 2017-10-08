@@ -42,8 +42,8 @@ def init_config():
 
     parser.add_argument('--data_folder', type=str, help='path to the data folder')
 
-    parser.add_argument('--decode_max_time_step', default=250, type=int, help='maximum number of time steps used '
-                                                                              'in decoding and sampling')
+    parser.add_argument('--decode_max_time_step', default=60, type=int, help='maximum number of time steps used '
+                                                                             'in decoding and sampling')
 
     parser.add_argument('--valid_niter', default=500, type=int, help='every n iterations to perform validation')
     parser.add_argument('--valid_metric', default='bleu', choices=['bleu', 'ppl', 'word_acc', 'sent_acc'], help='metric used for validation')
@@ -199,7 +199,8 @@ class NMT(nn.Module):
         if not beam_size:
             beam_size = args.beam_size
 
-        src_images_var = image_to_input_variable(src_images, cuda=args.cuda, is_test=True)
+        src_images_var = Variable(src_images, volatile=True, requires_grad=False)
+        # src_images_var = image_to_input_variable(src_images, cuda=args.cuda, is_test=True)
 
         src_images_encoding = self.encode(src_images_var)
 
@@ -532,6 +533,7 @@ def train_raml(args):
     dataset = Dataset(args.data_folder)
 
     vocab, model, optimizer, nll_loss, cross_entropy_loss = init_training(args)
+    print('num. target words in vocab: %d' % len(vocab), file=sys.stderr)
 
     if args.raml_sample_mode == 'pre_sample':
         # dict of (src, [tgt: (sent, prob)])
@@ -540,7 +542,7 @@ def train_raml(args):
         raml_samples = read_raml_train_data(args.raml_sample_file, temp=tau)
         print('done[%d s].' % (time.time() - begin_time))
     elif args.raml_sample_mode.startswith('hamming_distance'):
-        print('sample from hamming distance payoff distribution')
+        print('sample from hamming distance payoff distribution', file=sys.stderr)
         payoff_prob, Z_qs = generate_hamming_distance_payoff_distribution(max_sent_len=args.decode_max_time_step,
                                                                           vocab_size=len(vocab) - 3,
                                                                           tau=tau)
@@ -569,7 +571,7 @@ def train_raml(args):
             if args.raml_sample_mode == 'pre_sample':
                 raise NotImplementedError()
             elif args.raml_sample_mode in ['hamming_distance', 'hamming_distance_impt_sample']:
-                for src_image, tgt_sents in batch_examples:
+                for image_id, src_image, tgt_sents in batch_examples:
                     tgt_samples = []  # make sure the ground truth y* is in the samples
                     references = [_tgt_sent[1:-1] for _tgt_sent in tgt_sents]  # remove <s> and </s>
                     tgt_sample_weights = []
@@ -638,11 +640,14 @@ def train_raml(args):
                         normalizer = sum(tgt_sample_weights)
                         tgt_sample_weights = [w / normalizer for w in tgt_sample_weights]
 
-                    raml_src_images.extend([src_image] * len(tgt_samples))
+                    raml_src_images.append(src_image)
                     raml_tgt_sents.extend([sample for sample, ref_sent_id in tgt_samples])
                     raml_tgt_weights.extend(tgt_sample_weights)
 
-            src_images_var = image_to_input_variable(raml_src_images, cuda=args.cuda)
+            src_images_var = Variable(torch.stack(raml_src_images), requires_grad=False)
+            src_images_var = src_images_var.unsqueeze(1)\
+                .expand(src_images_var.size(0), args.sample_size, src_images_var.size(1))\
+                .contiguous().view(-1, src_images_var.size(1))
             tgt_sents_var = sent_to_input_variable(raml_tgt_sents, vocab, cuda=args.cuda)
             weights_var = Variable(torch.FloatTensor(raml_tgt_weights), requires_grad=False)
             if args.cuda:
@@ -720,9 +725,9 @@ def train_raml(args):
                 dev_hyps = decode(model, dataset.valid_examples())
                 dev_hyps = [hyps[0] for hyps in dev_hyps]
                 if args.valid_metric == 'bleu':
-                    valid_metric = get_bleu([tgt for src, tgt in dataset.valid_examples()], dev_hyps)
+                    valid_metric = get_bleu([tgt for id, src, tgt in dataset.valid_examples()], dev_hyps)
                 else:
-                    valid_metric = get_acc([tgt for src, tgt in dataset.valid_examples()], dev_hyps, acc_type=args.valid_metric)
+                    valid_metric = get_acc([tgt for id, src, tgt in dataset.valid_examples()], dev_hyps, acc_type=args.valid_metric)
                 print('validation: iter %d, dev. %s %f' % (train_iter, args.valid_metric, valid_metric),
                       file=sys.stderr)
 
@@ -794,7 +799,7 @@ def decode(model, data, verbose=True):
     begin_time = time.time()
 
     example_num = 0
-    for src_image, tgt_sents in data:
+    for image_id, src_image, tgt_sents in data:
         hyps = model.translate(src_image)
         hypotheses.append(hyps)
         example_num += 1
@@ -898,9 +903,9 @@ def test(args):
     hypotheses = decode(model, dataset.test_examples())
     top_hypotheses = [hyps[0] for hyps in hypotheses]
 
-    bleu_score = get_bleu([tgt for src, tgt in dataset.test_examples()], top_hypotheses)
-    word_acc = get_acc([tgt for src, tgt in dataset.test_examples()], top_hypotheses, 'word_acc')
-    sent_acc = get_acc([tgt for src, tgt in dataset.test_examples()], top_hypotheses, 'sent_acc')
+    bleu_score = get_bleu([tgt for id, src, tgt in dataset.test_examples()], top_hypotheses)
+    word_acc = get_acc([tgt for id, src, tgt in dataset.test_examples()], top_hypotheses, 'word_acc')
+    sent_acc = get_acc([tgt for id, src, tgt in dataset.test_examples()], top_hypotheses, 'sent_acc')
     print('Corpus Level BLEU: %f, word level acc: %f, sentence level acc: %f' % (bleu_score, word_acc, sent_acc),
           file=sys.stderr)
 

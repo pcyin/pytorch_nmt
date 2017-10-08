@@ -31,11 +31,13 @@ class Dataset(object):
             np.random.shuffle(_file_list)
 
         for f_name in _file_list:
-            captions = self.captions[f_name.split('.')[0]]
+            fid = f_name.split('.')[0]
+            captions = self.captions[fid]
             captions = [['<s>'] + word_tokenize(caption) + ['</s>'] for caption in captions]
             img_encoding = load_lua(os.path.join(self.data_folder, folder, f_name))
-
-            yield img_encoding, captions
+            if torch.cuda.is_available():
+                img_encoding = img_encoding.cuda()
+            yield fid, img_encoding, captions
 
     def train_examples(self, shuffle=False):
         return self.examples(self.train_files, 'train/', shuffle=shuffle)
