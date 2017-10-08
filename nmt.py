@@ -784,7 +784,7 @@ def get_acc(references, hypotheses, acc_type='word'):
         if acc_type == 'word_acc':
             acc = max(len([1 for ref_w, hyp_w in zip(ref, hyp) if ref_w == hyp_w]) / float(len(hyp) + 1e-6) for ref in refs)
         else:
-            acc = 1. if max(all(ref_w == hyp_w for ref_w, hyp_w in zip(ref, hyp)) for ref in refs) else 0.
+            acc = 1. if (len(hyp) > 0 and max(all(ref_w == hyp_w for ref_w, hyp_w in zip(ref, hyp)) for ref in refs)) else 0.
         cum_acc += acc
 
     acc = cum_acc / len(hypotheses)
