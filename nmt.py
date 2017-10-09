@@ -118,18 +118,11 @@ class NMT(nn.Module):
         self.image_encoding_linear = nn.Linear(args.raw_image_size, args.hidden_size, bias=True)
         self.decoder_lstm = nn.LSTMCell(args.embed_size, args.hidden_size)
 
-        # transformation of decoder hidden states and context vectors before reading out target words
-        # this produces the `attentional vector` in (Luong et al., 2015)
-        self.att_vec_linear = nn.Linear(args.hidden_size + args.hidden_size, args.hidden_size, bias=False)
-
         # prediction layer of the target vocabulary
         self.readout = nn.Linear(args.hidden_size, len(vocab), bias=False)
 
         # dropout layer
         self.dropout = nn.Dropout(args.dropout)
-
-        # initialize the decoder's state and cells with encoder hidden states
-        self.decoder_cell_init = nn.Linear(args.hidden_size * 2, args.hidden_size)
 
     def forward(self, src_images, tgt_sents):
         src_encodings = self.encode(src_images)
@@ -170,13 +163,7 @@ class NMT(nn.Module):
             h_t, cell_t = self.decoder_lstm(x, hidden)
             h_t = self.dropout(h_t)
 
-            # no attention!
-            ctx_t = src_images_encoding
-
-            att_t = F.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t], 1)))   # E.q. (5)
-            att_t = self.dropout(att_t)
-
-            score_t = self.readout(att_t)   # E.q. (6)
+            score_t = self.readout(h_t)   # E.q. (6)
             scores.append(score_t)
 
             hidden = h_t, cell_t
@@ -233,12 +220,7 @@ class NMT(nn.Module):
             h_t, cell_t = self.decoder_lstm(x, hidden)
             h_t = self.dropout(h_t)
 
-            ctx_t = expanded_src_encoding
-
-            att_t = F.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t], 1)))
-            att_t = self.dropout(att_t)
-
-            score_t = self.readout(att_t)
+            score_t = self.readout(h_t)
             p_t = F.log_softmax(score_t)
 
             live_hyp_num = beam_size - len(completed_hypotheses)
