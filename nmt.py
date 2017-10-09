@@ -361,14 +361,7 @@ def init_training(args):
 
 
 def train(args):
-    train_data_src = read_corpus(args.train_src, source='src')
-    train_data_tgt = read_corpus(args.train_tgt, source='tgt')
-
-    dev_data_src = read_corpus(args.dev_src, source='src')
-    dev_data_tgt = read_corpus(args.dev_tgt, source='tgt')
-
-    train_data = zip(train_data_src, train_data_tgt)
-    dev_data = zip(dev_data_src, dev_data_tgt)
+    dataset = Dataset(args.data_folder)
 
     vocab, model, optimizer, nll_loss, cross_entropy_loss = init_training(args)
 
@@ -380,20 +373,25 @@ def train(args):
 
     while True:
         epoch += 1
-        for src_sents, tgt_sents in data_iter(train_data, batch_size=args.batch_size):
+        for batch_examples in dataset.batch_iter('train', batch_size=args.batch_size, shuffle=True):
             train_iter += 1
 
-            src_sents_var = sent_to_input_variable(src_sents, vocab.src, cuda=args.cuda)
-            tgt_sents_var = sent_to_input_variable(tgt_sents, vocab.tgt, cuda=args.cuda)
+            batch_src_images = []
+            batch_tgt_sents = []
+            for image_id, src_image, tgt_sents in batch_examples:
+                batch_src_images.extend([src_image] * len(tgt_sents))
+                batch_tgt_sents.extend(tgt_sents)
 
-            batch_size = len(src_sents)
-            src_sents_len = [len(s) for s in src_sents]
-            pred_tgt_word_num = sum(len(s[1:]) for s in tgt_sents) # omitting leading `<s>`
+            src_images_var = Variable(torch.stack(batch_src_images), requires_grad=False)
+            tgt_sents_var = sent_to_input_variable(batch_tgt_sents, vocab, cuda=args.cuda)
+
+            batch_size = len(batch_tgt_sents)
+            pred_tgt_word_num = sum(len(s[1:]) for s in batch_tgt_sents) # omitting leading `<s>`
 
             optimizer.zero_grad()
 
             # (tgt_sent_len, batch_size, tgt_vocab_size)
-            scores = model(src_sents_var, src_sents_len, tgt_sents_var[:-1])
+            scores = model(src_images_var, tgt_sents_var[:-1])
 
             word_loss = cross_entropy_loss(scores.view(-1, scores.size(2)), tgt_sents_var[1:].view(-1))
             loss = word_loss / batch_size
@@ -439,23 +437,15 @@ def train(args):
                 model.eval()
 
                 # compute dev. ppl and bleu
-
-                dev_loss = evaluate_loss(model, dev_data, cross_entropy_loss)
-                dev_ppl = np.exp(dev_loss)
-
-                if args.valid_metric in ['bleu', 'word_acc', 'sent_acc']:
-                    dev_hyps = decode(model, dev_data)
-                    dev_hyps = [hyps[0] for hyps in dev_hyps]
-                    if args.valid_metric == 'bleu':
-                        valid_metric = get_bleu([tgt for src, tgt in dev_data], dev_hyps)
-                    else:
-                        valid_metric = get_acc([tgt for src, tgt in dev_data], dev_hyps, acc_type=args.valid_metric)
-                    print('validation: iter %d, dev. ppl %f, dev. %s %f' % (train_iter, dev_ppl, args.valid_metric, valid_metric),
-                          file=sys.stderr)
+                dev_hyps = decode(model, dataset.valid_examples())
+                dev_hyps = [hyps[0] for hyps in dev_hyps]
+                if args.valid_metric == 'bleu':
+                    valid_metric = get_bleu([tgt for id, src, tgt in dataset.valid_examples()], dev_hyps)
                 else:
-                    valid_metric = -dev_ppl
-                    print('validation: iter %d, dev. ppl %f' % (train_iter, dev_ppl),
-                          file=sys.stderr)
+                    valid_metric = get_acc([tgt for id, src, tgt in dataset.valid_examples()], dev_hyps,
+                                           acc_type=args.valid_metric)
+                print('validation: iter %d, dev. %s %f' % (train_iter, args.valid_metric, valid_metric),
+                      file=sys.stderr)
 
                 model.train()
 
@@ -489,7 +479,6 @@ def train(args):
                         print('early stop!', file=sys.stderr)
                         print('the best model is from iteration [%d]' % best_model_iter, file=sys.stderr)
                         exit(0)
-
 
 def read_raml_train_data(data_file, temp):
     train_data = dict()
