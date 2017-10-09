@@ -116,7 +116,7 @@ class NMT(nn.Module):
         self.tgt_embed = nn.Embedding(len(vocab), args.embed_size, padding_idx=vocab['<pad>'])
 
         self.image_encoding_linear = nn.Linear(args.raw_image_size, args.hidden_size, bias=True)
-        self.decoder_lstm = nn.LSTMCell(args.embed_size + args.hidden_size, args.hidden_size)
+        self.decoder_lstm = nn.LSTMCell(args.embed_size, args.hidden_size)
 
         # transformation of decoder hidden states and context vectors before reading out target words
         # this produces the `attentional vector` in (Luong et al., 2015)
@@ -158,17 +158,13 @@ class NMT(nn.Module):
         new_tensor = init_cell.data.new
         batch_size = src_images_encoding.size(0)
 
-        # initialize attentional vector
-        att_tm1 = Variable(new_tensor(batch_size, self.args.hidden_size).zero_(), requires_grad=False)
-
         # (tgt_sent_len, batch_size, embed_size)
         tgt_word_embed = self.tgt_embed(tgt_sents)
         scores = []
 
         # start from `<s>`, until y_{T-1}
         for y_tm1_embed in tgt_word_embed.split(split_size=1):
-            # input feeding: concate y_tm1 and previous attentional vector
-            x = torch.cat([y_tm1_embed.squeeze(0), att_tm1], 1)
+            x = y_tm1_embed.squeeze(0)
 
             # h_t: (batch_size, hidden_size)
             h_t, cell_t = self.decoder_lstm(x, hidden)
@@ -183,7 +179,6 @@ class NMT(nn.Module):
             score_t = self.readout(att_t)   # E.q. (6)
             scores.append(score_t)
 
-            att_tm1 = att_t
             hidden = h_t, cell_t
 
         scores = torch.stack(scores)
@@ -208,10 +203,8 @@ class NMT(nn.Module):
         init_cell = src_images_encoding
         hidden = (init_state, init_cell)
 
-        att_tm1 = Variable(torch.zeros(1, self.args.hidden_size), volatile=True)
         hyp_scores = Variable(torch.zeros(1), volatile=True)
         if args.cuda:
-            att_tm1 = att_tm1.cuda()
             hyp_scores = hyp_scores.cuda()
 
         eos_id = self.vocab['</s>']
@@ -234,9 +227,7 @@ class NMT(nn.Module):
             if args.cuda:
                 y_tm1 = y_tm1.cuda()
 
-            y_tm1_embed = self.tgt_embed(y_tm1)
-
-            x = torch.cat([y_tm1_embed, att_tm1], 1)
+            x = self.tgt_embed(y_tm1)
 
             # h_t: (hyp_num, hidden_size)
             h_t, cell_t = self.decoder_lstm(x, hidden)
@@ -279,7 +270,6 @@ class NMT(nn.Module):
                 live_hyp_ids = live_hyp_ids.cuda()
 
             hidden = (h_t[live_hyp_ids], cell_t[live_hyp_ids])
-            att_tm1 = att_t[live_hyp_ids]
 
             hyp_scores = Variable(torch.FloatTensor(new_hyp_scores), volatile=True) # new_hyp_scores[live_hyp_ids]
             if args.cuda:
