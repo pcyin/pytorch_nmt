@@ -551,8 +551,15 @@ def train_sqdml(args):
                     sample_size = args.sample_size - len(tgt_dist_samples)
                     if sample_size > 0:
                         tgt_sent_id_samples = np.random.choice(range(tgt_sents_num), size=sample_size, replace=True)
-                        e_samples = np.random.choice(range(min_tgt_sent_len + 1), p=payoff_prob[min_tgt_sent_len],
-                                                     size=sample_size, replace=True)
+                        e_samples = []
+                        for tgt_sent_id in tgt_sent_id_samples:
+                            tgt_sent_len = tgt_sent_lens[tgt_sent_id]
+                            e_sample = np.random.choice(range(tgt_sent_len + 1), p=payoff_prob[tgt_sent_len])
+                            e_samples.append(e_sample)
+
+                        # e_samples = np.random.choice(range(min_tgt_sent_len + 1), p=payoff_prob[min_tgt_sent_len],
+                        #                              size=sample_size, replace=True)
+
                         tgt_dist_samples += zip(tgt_sent_id_samples, e_samples)
 
                     for sample_id, (tgt_sent_id, e) in enumerate(tgt_dist_samples):
@@ -573,11 +580,15 @@ def train_sqdml(args):
 
                         # if enable importance sampling, compute unnormalized q-distribution value: \tilde{q}(y|{y*})
                         if args.raml_sample_mode == 'hamming_distance_impt_sample':
-                            bleu_scores = [1. if (e == 0 and _i == tgt_sent_id)
-                                           else sentence_bleu([references[_i]],
-                                                              sampled_tgt_sent[1: -1],
-                                                              smoothing_function=sm_func)
-                                           for _i in xrange(tgt_sents_num)]
+                            bleu_scores = []
+                            for _i in xrange(tgt_sents_num):
+                                if e == 0 and _i == tgt_sent_id:
+                                    bleu_score = 1.
+                                else:
+                                    bleu_score = sentence_bleu([references[_i]], sampled_tgt_sent[1: -1],
+                                                               smoothing_function=sm_func)
+                                bleu_scores.append(bleu_score)
+
                             q_tilde = math.exp((1. / tgt_sents_num) * sum(bleu_scores) / tau)
 
                             mixture_probs = []
