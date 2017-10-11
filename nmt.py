@@ -45,8 +45,7 @@ def init_config():
     parser.add_argument('--decode_max_time_step', default=60, type=int, help='maximum number of time steps used '
                                                                              'in decoding and sampling')
 
-    parser.add_argument('--valid_niter', default=500, type=int, help='every n iterations to perform validation')
-    parser.add_argument('--valid_metric', default='bleu', choices=['bleu', 'ppl', 'word_acc', 'sent_acc'], help='metric used for validation')
+    parser.add_argument('--valid_metric', default='bleu', choices=['bleu', 'avg_sent_bleu', 'ppl', 'word_acc', 'sent_acc'], help='metric used for validation')
     parser.add_argument('--log_every', default=50, type=int, help='every n iterations to log training statistics')
     parser.add_argument('--load_model', default=None, type=str, help='load a pre-trained model')
     parser.add_argument('--save_to', default='model', type=str, help='save trained model to')
@@ -395,62 +394,57 @@ def train(args):
                 train_time = time.time()
                 report_loss = report_tgt_words = report_examples = 0.
 
-            # perform validation
-            if train_iter % args.valid_niter == 0:
-                print('epoch %d, iter %d, cum. loss %.2f, cum. ppl %.2f cum. examples %d' % (epoch, train_iter,
-                                                                                         cum_loss / cum_batches,
-                                                                                         np.exp(cum_loss / cum_tgt_words),
-                                                                                         cum_examples), file=sys.stderr)
+        # perform validation after each epoch
+        print('epoch %d, iter %d, cum. loss %.2f, cum. ppl %.2f cum. examples %d' % (epoch, train_iter,
+                                                                                 cum_loss / cum_batches,
+                                                                                 np.exp(cum_loss / cum_tgt_words),
+                                                                                 cum_examples), file=sys.stderr)
 
-                cum_loss = cum_batches = cum_tgt_words = 0.
-                valid_num += 1
+        cum_loss = cum_batches = cum_tgt_words = 0.
+        valid_num += 1
 
-                print('begin validation ...', file=sys.stderr)
-                model.eval()
+        print('begin validation ...', file=sys.stderr)
+        model.eval()
 
-                # compute dev. ppl and bleu
-                dev_hyps = decode(model, dataset.valid_examples())
-                dev_hyps = [hyps[0] for hyps in dev_hyps]
-                if args.valid_metric == 'bleu':
-                    valid_metric = get_bleu([tgt for id, src, tgt in dataset.valid_examples()], dev_hyps)
-                else:
-                    valid_metric = get_acc([tgt for id, src, tgt in dataset.valid_examples()], dev_hyps,
-                                           acc_type=args.valid_metric)
-                print('validation: iter %d, dev. %s %f' % (train_iter, args.valid_metric, valid_metric),
-                      file=sys.stderr)
+        # compute dev. ppl and bleu
+        dev_hyps = decode(model, dataset.valid_examples())
+        dev_hyps = [hyps[0] for hyps in dev_hyps]
+        valid_metric = get_metric_score([tgt for id, src, tgt in dataset.valid_examples()], dev_hyps, args.valid_metric)
+        print('validation: iter %d, dev. %s %f' % (train_iter, args.valid_metric, valid_metric),
+              file=sys.stderr)
 
-                model.train()
+        model.train()
 
-                is_better = len(hist_valid_scores) == 0 or valid_metric > max(hist_valid_scores)
-                is_better_than_last = len(hist_valid_scores) == 0 or valid_metric > hist_valid_scores[-1]
-                hist_valid_scores.append(valid_metric)
+        is_better = len(hist_valid_scores) == 0 or valid_metric > max(hist_valid_scores)
+        is_better_than_last = len(hist_valid_scores) == 0 or valid_metric > hist_valid_scores[-1]
+        hist_valid_scores.append(valid_metric)
 
-                if valid_num > args.save_model_after:
-                    model_file = args.save_to + '.iter%d.bin' % train_iter
-                    print('save model to [%s]' % model_file, file=sys.stderr)
-                    model.save(model_file)
+        if valid_num > args.save_model_after:
+            model_file = args.save_to + '.iter%d.bin' % train_iter
+            print('save model to [%s]' % model_file, file=sys.stderr)
+            model.save(model_file)
 
-                if (not is_better_than_last) and args.lr_decay:
-                    lr = optimizer.param_groups[0]['lr'] * args.lr_decay
-                    print('decay learning rate to %f' % lr, file=sys.stderr)
-                    optimizer.param_groups[0]['lr'] = lr
+        if (not is_better_than_last) and args.lr_decay:
+            lr = optimizer.param_groups[0]['lr'] * args.lr_decay
+            print('decay learning rate to %f' % lr, file=sys.stderr)
+            optimizer.param_groups[0]['lr'] = lr
 
-                if is_better:
-                    patience = 0
-                    best_model_iter = train_iter
+        if is_better:
+            patience = 0
+            best_model_iter = train_iter
 
-                    if valid_num > args.save_model_after:
-                        print('save currently the best model ..', file=sys.stderr)
-                        model_file_abs_path = os.path.abspath(model_file)
-                        symlin_file_abs_path = os.path.abspath(args.save_to + '.bin')
-                        os.system('ln -sf %s %s' % (model_file_abs_path, symlin_file_abs_path))
-                else:
-                    patience += 1
-                    print('hit patience %d' % patience, file=sys.stderr)
-                    if patience == args.patience:
-                        print('early stop!', file=sys.stderr)
-                        print('the best model is from iteration [%d]' % best_model_iter, file=sys.stderr)
-                        exit(0)
+            if valid_num > args.save_model_after:
+                print('save currently the best model ..', file=sys.stderr)
+                model_file_abs_path = os.path.abspath(model_file)
+                symlin_file_abs_path = os.path.abspath(args.save_to + '.bin')
+                os.system('ln -sf %s %s' % (model_file_abs_path, symlin_file_abs_path))
+        else:
+            patience += 1
+            print('hit patience %d' % patience, file=sys.stderr)
+            if patience == args.patience:
+                print('early stop!', file=sys.stderr)
+                print('the best model is from iteration [%d]' % best_model_iter, file=sys.stderr)
+                exit(0)
 
 def read_raml_train_data(data_file, temp):
     train_data = dict()
@@ -678,63 +672,60 @@ def train_sqdml(args):
                 train_time = time.time()
                 report_loss = report_weighted_loss = report_tgt_words = report_examples = 0.
 
-            # perform validation
-            if train_iter % args.valid_niter == 0:
-                print('epoch %d, iter %d, cum. loss %.2f, '
-                      'cum. ppl %.2f cum. examples %d' % (epoch, train_iter,
-                                                          cum_weighted_loss / cum_batches,
-                                                          np.exp(cum_loss / cum_tgt_words),
-                                                          cum_examples),
-                      file=sys.stderr)
+        # perform validation
+        print('epoch %d, iter %d, cum. loss %.2f, '
+              'cum. ppl %.2f cum. examples %d' % (epoch, train_iter,
+                                                  cum_weighted_loss / cum_batches,
+                                                  np.exp(cum_loss / cum_tgt_words),
+                                                  cum_examples),
+              file=sys.stderr)
 
-                cum_loss = cum_weighted_loss = cum_batches = cum_tgt_words = 0.
-                valid_num += 1
+        cum_loss = cum_weighted_loss = cum_batches = cum_tgt_words = 0.
+        valid_num += 1
 
-                print('begin validation ...', file=sys.stderr)
-                model.eval()
+        print('begin validation ...', file=sys.stderr)
+        model.eval()
 
-                # compute dev. ppl and bleu
-                dev_hyps = decode(model, dataset.valid_examples())
-                dev_hyps = [hyps[0] for hyps in dev_hyps]
-                if args.valid_metric == 'bleu':
-                    valid_metric = get_bleu([tgt for id, src, tgt in dataset.valid_examples()], dev_hyps)
-                else:
-                    valid_metric = get_acc([tgt for id, src, tgt in dataset.valid_examples()], dev_hyps, acc_type=args.valid_metric)
-                print('validation: iter %d, dev. %s %f' % (train_iter, args.valid_metric, valid_metric),
-                      file=sys.stderr)
+        # compute dev. ppl and bleu
+        dev_hyps = decode(model, dataset.valid_examples())
+        dev_hyps = [hyps[0] for hyps in dev_hyps]
+        valid_metric = get_metric_score([tgt for id, src, tgt in dataset.valid_examples()], dev_hyps,
+                                        args.valid_metric)
+        print('validation: iter %d, dev. %s %f' % (train_iter, args.valid_metric, valid_metric),
+              file=sys.stderr)
 
-                model.train()
+        model.train()
 
-                is_better = len(hist_valid_scores) == 0 or valid_metric > max(hist_valid_scores)
-                is_better_than_last = len(hist_valid_scores) == 0 or valid_metric > hist_valid_scores[-1]
-                hist_valid_scores.append(valid_metric)
+        is_better = len(hist_valid_scores) == 0 or valid_metric > max(hist_valid_scores)
+        is_better_than_last = len(hist_valid_scores) == 0 or valid_metric > hist_valid_scores[-1]
+        hist_valid_scores.append(valid_metric)
 
-                if valid_num > args.save_model_after:
-                    model_file = args.save_to + '.iter%d.bin' % train_iter
-                    print('save model to [%s]' % model_file, file=sys.stderr)
-                    model.save(model_file)
+        if valid_num > args.save_model_after:
+            model_file = args.save_to + '.iter%d.bin' % train_iter
+            print('save model to [%s]' % model_file, file=sys.stderr)
+            model.save(model_file)
 
-                if (not is_better_than_last) and args.lr_decay:
-                    lr = optimizer.param_groups[0]['lr'] * args.lr_decay
-                    print('decay learning rate to %f' % lr, file=sys.stderr)
-                    optimizer.param_groups[0]['lr'] = lr
+        if (not is_better_than_last) and args.lr_decay:
+            lr = optimizer.param_groups[0]['lr'] * args.lr_decay
+            print('decay learning rate to %f' % lr, file=sys.stderr)
+            optimizer.param_groups[0]['lr'] = lr
 
-                if is_better:
-                    patience = 0
-                    best_model_iter = train_iter
+        if is_better:
+            patience = 0
+            best_model_iter = train_iter
 
-                    if valid_num > args.save_model_after:
-                        print('save currently the best model ..', file=sys.stderr)
-                        model_file_abs_path = os.path.abspath(model_file)
-                        symlin_file_abs_path = os.path.abspath(args.save_to + '.bin')
-                        os.system('ln -sf %s %s' % (model_file_abs_path, symlin_file_abs_path))
-                else:
-                    patience += 1
-                    print('hit patience %d' % patience, file=sys.stderr)
-                    if patience == args.patience:
-                        print('early stop!', file=sys.stderr)
-                        print('the best model is from iteration [%d]' % best_model_iter, file=sys.stderr)
-                        exit(0)
+            if valid_num > args.save_model_after:
+                print('save currently the best model ..', file=sys.stderr)
+                model_file_abs_path = os.path.abspath(model_file)
+                symlin_file_abs_path = os.path.abspath(args.save_to + '.bin')
+                os.system('ln -sf %s %s' % (model_file_abs_path, symlin_file_abs_path))
+        else:
+            patience += 1
+            print('hit patience %d' % patience, file=sys.stderr)
+            if patience == args.patience:
+                print('early stop!', file=sys.stderr)
+                print('the best model is from iteration [%d]' % best_model_iter, file=sys.stderr)
+                exit(0)
 
 
 def train_raml(args):
@@ -894,89 +885,92 @@ def train_raml(args):
                 train_time = time.time()
                 report_loss = report_weighted_loss = report_tgt_words = report_examples = 0.
 
-            # perform validation
-            if train_iter % args.valid_niter == 0:
-                print('epoch %d, iter %d, cum. loss %.2f, '
-                      'cum. ppl %.2f cum. examples %d' % (epoch, train_iter,
-                                                          cum_weighted_loss / cum_batches,
-                                                          np.exp(cum_loss / cum_tgt_words),
-                                                          cum_examples),
-                      file=sys.stderr)
+        # perform validation
+        print('epoch %d, iter %d, cum. loss %.2f, '
+              'cum. ppl %.2f cum. examples %d' % (epoch, train_iter,
+                                                  cum_weighted_loss / cum_batches,
+                                                  np.exp(cum_loss / cum_tgt_words),
+                                                  cum_examples),
+              file=sys.stderr)
 
-                cum_loss = cum_weighted_loss = cum_batches = cum_tgt_words = 0.
-                valid_num += 1
+        cum_loss = cum_weighted_loss = cum_batches = cum_tgt_words = 0.
+        valid_num += 1
 
-                print('begin validation ...', file=sys.stderr)
-                model.eval()
+        print('begin validation ...', file=sys.stderr)
+        model.eval()
 
-                # compute dev. ppl and bleu
-                dev_hyps = decode(model, dataset.valid_examples())
-                dev_hyps = [hyps[0] for hyps in dev_hyps]
-                if args.valid_metric == 'bleu':
-                    valid_metric = get_bleu([tgt for id, src, tgt in dataset.valid_examples()], dev_hyps)
-                else:
-                    valid_metric = get_acc([tgt for id, src, tgt in dataset.valid_examples()], dev_hyps, acc_type=args.valid_metric)
-                print('validation: iter %d, dev. %s %f' % (train_iter, args.valid_metric, valid_metric),
-                      file=sys.stderr)
+        # compute dev. ppl and bleu
+        dev_hyps = decode(model, dataset.valid_examples())
+        dev_hyps = [hyps[0] for hyps in dev_hyps]
+        valid_metric = get_metric_score([tgt for id, src, tgt in dataset.valid_examples()], dev_hyps, args.valid_metric)
+        print('validation: iter %d, dev. %s %f' % (train_iter, args.valid_metric, valid_metric),
+              file=sys.stderr)
 
-                model.train()
+        model.train()
 
-                is_better = len(hist_valid_scores) == 0 or valid_metric > max(hist_valid_scores)
-                is_better_than_last = len(hist_valid_scores) == 0 or valid_metric > hist_valid_scores[-1]
-                hist_valid_scores.append(valid_metric)
+        is_better = len(hist_valid_scores) == 0 or valid_metric > max(hist_valid_scores)
+        is_better_than_last = len(hist_valid_scores) == 0 or valid_metric > hist_valid_scores[-1]
+        hist_valid_scores.append(valid_metric)
 
-                if valid_num > args.save_model_after:
-                    model_file = args.save_to + '.iter%d.bin' % train_iter
-                    print('save model to [%s]' % model_file, file=sys.stderr)
-                    model.save(model_file)
+        if valid_num > args.save_model_after:
+            model_file = args.save_to + '.iter%d.bin' % train_iter
+            print('save model to [%s]' % model_file, file=sys.stderr)
+            model.save(model_file)
 
-                if (not is_better_than_last) and args.lr_decay:
-                    lr = optimizer.param_groups[0]['lr'] * args.lr_decay
-                    print('decay learning rate to %f' % lr, file=sys.stderr)
-                    optimizer.param_groups[0]['lr'] = lr
+        if (not is_better_than_last) and args.lr_decay:
+            lr = optimizer.param_groups[0]['lr'] * args.lr_decay
+            print('decay learning rate to %f' % lr, file=sys.stderr)
+            optimizer.param_groups[0]['lr'] = lr
 
-                if is_better:
-                    patience = 0
-                    best_model_iter = train_iter
+        if is_better:
+            patience = 0
+            best_model_iter = train_iter
 
-                    if valid_num > args.save_model_after:
-                        print('save currently the best model ..', file=sys.stderr)
-                        model_file_abs_path = os.path.abspath(model_file)
-                        symlin_file_abs_path = os.path.abspath(args.save_to + '.bin')
-                        os.system('ln -sf %s %s' % (model_file_abs_path, symlin_file_abs_path))
-                else:
-                    patience += 1
-                    print('hit patience %d' % patience, file=sys.stderr)
-                    if patience == args.patience:
-                        print('early stop!', file=sys.stderr)
-                        print('the best model is from iteration [%d]' % best_model_iter, file=sys.stderr)
-                        exit(0)
+            if valid_num > args.save_model_after:
+                print('save currently the best model ..', file=sys.stderr)
+                model_file_abs_path = os.path.abspath(model_file)
+                symlin_file_abs_path = os.path.abspath(args.save_to + '.bin')
+                os.system('ln -sf %s %s' % (model_file_abs_path, symlin_file_abs_path))
+        else:
+            patience += 1
+            print('hit patience %d' % patience, file=sys.stderr)
+            if patience == args.patience:
+                print('early stop!', file=sys.stderr)
+                print('the best model is from iteration [%d]' % best_model_iter, file=sys.stderr)
+                exit(0)
 
 
-def get_bleu(references, hypotheses):
-    # compute BLEU
+def get_metric_score(references, hypotheses, metric='bleu'):
     references = [[ref[1:-1] for ref in refs] for refs in references]
     hypotheses = [hyp[1:-1] for hyp in hypotheses]
-    bleu_score = corpus_bleu(references, hypotheses)
 
-    return bleu_score
+    if metric == 'bleu':
+        return corpus_bleu(references, hypotheses)
+    elif metric == 'avg_sent_bleu':
+        sm_func = SmoothingFunction().method3
+        bleu_score = np.average([np.average([sentence_bleu([ref_sent], hyp_sent, smoothing_function=sm_func)
+                                             for ref_sent in ref_sents])
+                                 for hyp_sent, ref_sents in zip(hypotheses, references)])
 
-
-def get_acc(references, hypotheses, acc_type='word'):
-    assert acc_type == 'word_acc' or acc_type == 'sent_acc'
-    cum_acc = 0.
-
-    for refs, hyp in zip(references, hypotheses):
-        refs = [ref[1:-1] for ref in refs]
-        hyp = hyp[1:-1]
-        if acc_type == 'word_acc':
-            acc = max(len([1 for ref_w, hyp_w in zip(ref, hyp) if ref_w == hyp_w]) / float(len(hyp) + 1e-6) for ref in refs)
-        else:
-            acc = 1. if (len(hyp) > 0 and max(all(ref_w == hyp_w for ref_w, hyp_w in zip(ref, hyp)) for ref in refs)) else 0.
-        cum_acc += acc
-
-    acc = cum_acc / len(hypotheses)
-    return acc
+        return bleu_score
+    elif metric == 'word_acc':
+        cum_acc = 0.
+        for refs, hyp in zip(references, hypotheses):
+            acc = max(len([1 for ref_w, hyp_w in zip(ref, hyp) if ref_w == hyp_w]) / float(len(hyp) + 1e-6)
+                      for ref in refs)
+            cum_acc += acc
+        acc = cum_acc / len(hypotheses)
+        return acc
+    elif metric == 'sent_acc':
+        cum_acc = 0.
+        for refs, hyp in zip(references, hypotheses):
+            acc = 1. if (len(hyp) > 0 and
+                         max(all(ref_w == hyp_w for ref_w, hyp_w in zip(ref, hyp)) for ref in refs)) else 0.
+            cum_acc += acc
+        acc = cum_acc / len(hypotheses)
+        return acc
+    else:
+        raise ValueError('unknown evaluation metric!')
 
 
 def decode(model, data, verbose=True):
@@ -1090,11 +1084,16 @@ def test(args):
 
     hypotheses = decode(model, dataset.test_examples())
     top_hypotheses = [hyps[0] for hyps in hypotheses]
+    references = [tgt for id, src, tgt in dataset.test_examples()]
 
-    bleu_score = get_bleu([tgt for id, src, tgt in dataset.test_examples()], top_hypotheses)
-    word_acc = get_acc([tgt for id, src, tgt in dataset.test_examples()], top_hypotheses, 'word_acc')
-    sent_acc = get_acc([tgt for id, src, tgt in dataset.test_examples()], top_hypotheses, 'sent_acc')
-    print('Corpus Level BLEU: %f, word level acc: %f, sentence level acc: %f' % (bleu_score, word_acc, sent_acc),
+    bleu_score = get_metric_score(references, top_hypotheses, 'bleu')
+    avg_sent_bleu_score = get_metric_score(references, top_hypotheses, 'avg_sent_bleu')
+    word_acc = get_metric_score(references, top_hypotheses, 'word_acc')
+    sent_acc = get_metric_score(references, top_hypotheses, 'sent_acc')
+    print('corpus level BLEU: %f, average sentence level BLEU: %f, word level acc: %f, sentence level acc: %f' % (bleu_score,
+                                                                                                         avg_sent_bleu_score,
+                                                                                                         word_acc,
+                                                                                                         sent_acc),
           file=sys.stderr)
 
     if args.save_to_file:

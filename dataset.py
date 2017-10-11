@@ -6,7 +6,7 @@ import sys
 import torch
 from torch.utils.serialization import load_lua
 from collections import namedtuple
-from nltk import word_tokenize
+# from nltk import word_tokenize
 
 def get_file_list(folder):
     file_list = []
@@ -33,7 +33,7 @@ class Dataset(object):
         for f_name in _file_list:
             fid = f_name.split('.')[0]
             captions = self.captions[fid]
-            captions = [['<s>'] + word_tokenize(caption) + ['</s>'] for caption in captions]
+            captions = [['<s>'] + caption.split(' ') + ['</s>'] for caption in captions]
             img_encoding = load_lua(os.path.join(self.data_folder, folder, f_name))
             if torch.cuda.is_available():
                 img_encoding = img_encoding.cuda()
