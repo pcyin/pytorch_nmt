@@ -60,6 +60,7 @@ def init_config():
     parser.add_argument('--lr_decay', default=0.5, type=float, help='decay learning rate if the validation performance drops')
 
     # raml training
+    parser.add_argument('--debug', action='store_true', default=False)
     parser.add_argument('--temp', default=0.85, type=float, help='temperature in reward distribution')
     parser.add_argument('--raml_sample_mode', default='pre_sample',
                         choices=['pre_sample', 'hamming_distance', 'hamming_distance_impt_sample'],
@@ -822,11 +823,12 @@ def train_raml(args):
                         else:
                             tgt_sample_weights = [1.] * args.sample_size
 
-                        print('*' * 30)
-                        print('Target: %s' % ' '.join(tgt_sent))
-                        for tgt_sample, e, bleu_score, weight in zip(tgt_samples, e_samples, bleu_scores, tgt_sample_weights):
-                            print('Sample: %s ||| e: %d ||| bleu: %f ||| weight: %f' % (' '.join(tgt_sample), e, bleu_score, weight))
-                        print()
+                        if args.debug:
+                            print('*' * 30)
+                            print('Target: %s' % ' '.join(tgt_sent))
+                            for tgt_sample, e, bleu_score, weight in zip(tgt_samples, e_samples, bleu_scores, tgt_sample_weights):
+                                print('Sample: %s ||| e: %d ||| bleu: %f ||| weight: %f' % (' '.join(tgt_sample), e, bleu_score, weight))
+                            print()
 
                         raml_src_images.extend([src_image] * len(tgt_samples))
                         raml_tgt_sents.extend(tgt_samples)
