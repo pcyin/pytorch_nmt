@@ -822,6 +822,12 @@ def train_raml(args):
                         else:
                             tgt_sample_weights = [1.] * args.sample_size
 
+                        print('*' * 30)
+                        print('Target: %s' % ' '.join(tgt_sent))
+                        for tgt_sample, e, bleu_score, weight in zip(tgt_samples, e_samples, bleu_scores, tgt_sample_weights):
+                            print('Sample: %s ||| e: %d ||| bleu: %f ||| weight: %f' % (' '.join(tgt_sample), e, bleu_score, weight))
+                        print()
+
                         raml_src_images.extend([src_image] * len(tgt_samples))
                         raml_tgt_sents.extend(tgt_samples)
                         raml_tgt_weights.extend(tgt_sample_weights)
