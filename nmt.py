@@ -815,7 +815,7 @@ def train_raml(args):
 
                         # if enable importance sampling, compute importance weight
                         if args.raml_sample_mode == 'hamming_distance_impt_sample':
-                            tgt_sample_weights = [math.exp(bleu_score / tau) / math.exp(-e / tau) for e, bleu_score in
+                            tgt_sample_weights = [math.exp(bleu_score / tau)  for e, bleu_score in  # / math.exp(-e / tau)
                                                   zip(e_samples, bleu_scores)]
                             normalizer = sum(tgt_sample_weights)
                             tgt_sample_weights = [w / normalizer for w in tgt_sample_weights]
