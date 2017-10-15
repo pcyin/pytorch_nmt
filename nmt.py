@@ -60,6 +60,7 @@ def init_config():
     parser.add_argument('--lr_decay', default=0.5, type=float, help='decay learning rate if the validation performance drops')
 
     # raml training
+    parser.add_argument('--debug', default=False, action='store_true')
     parser.add_argument('--temp', default=0.85, type=float, help='temperature in reward distribution')
     parser.add_argument('--raml_sample_mode', default='pre_sample',
                         choices=['pre_sample', 'hamming_distance', 'hamming_distance_impt_sample'],
@@ -735,6 +736,7 @@ def train_raml(args):
 
     vocab, model, optimizer, nll_loss, cross_entropy_loss = init_training(args)
     print('num. target words in vocab: %d' % len(vocab), file=sys.stderr)
+    vocab_size = len(vocab) - 3
 
     if args.raml_sample_mode == 'pre_sample':
         # dict of (src, [tgt: (sent, prob)])
@@ -745,8 +747,14 @@ def train_raml(args):
     elif args.raml_sample_mode.startswith('hamming_distance'):
         print('sample from hamming distance payoff distribution', file=sys.stderr)
         payoff_prob, Z_qs = generate_hamming_distance_payoff_distribution(max_sent_len=args.decode_max_time_step,
-                                                                          vocab_size=len(vocab) - 3,
-                                                                          tau=tau)
+                                                                          vocab_size=vocab_size,
+                                                                          tau=tau, scale=1.)
+
+        if args.debug:
+            print('payoff distributions:', file=sys.stderr)
+            ranked_lens = sorted(payoff_prob)
+            for l in ranked_lens:
+                print('Len[%d]: %s' % (l, payoff_prob[l]), file=sys.stderr)
 
     train_iter = patience = cum_loss = report_loss = cum_tgt_words = report_tgt_words = 0
     report_weighted_loss = cum_weighted_loss = 0
@@ -770,7 +778,19 @@ def train_raml(args):
             raml_tgt_weights = []
 
             if args.raml_sample_mode == 'pre_sample':
-                raise NotImplementedError()
+                for image_id, src_image, tgt_sents in batch_examples:
+                    for tgt_sent in tgt_sents:
+                        tgt_samples_all = raml_samples[' '.join(tgt_sent)]
+
+                        if args.sample_size >= len(tgt_samples_all):
+                            tgt_samples = tgt_samples_all
+                        else:
+                            tgt_samples_id = np.random.choice(range(1, len(tgt_samples_all)), size=args.sample_size - 1, replace=False)
+                            tgt_samples = [tgt_samples_all[0]] + [tgt_samples_all[i] for i in tgt_samples_id] # make sure the ground truth y* is in the samples
+
+                        raml_src_images.extend([src_image] * len(tgt_samples))
+                        raml_tgt_sents.extend([['<s>'] + sent.split(' ') + ['</s>'] for sent, weight in tgt_samples])
+                        raml_tgt_weights.extend([weight for sent, weight in tgt_samples])
             elif args.raml_sample_mode in ['hamming_distance', 'hamming_distance_impt_sample']:
                 for image_id, src_image, tgt_sents in batch_examples:
                     # sample args.sample_size sentences from each target
@@ -822,11 +842,12 @@ def train_raml(args):
                         else:
                             tgt_sample_weights = [1.] * args.sample_size
 
-                        print('*' * 30)
-                        print('Target: %s' % ' '.join(tgt_sent))
-                        for tgt_sample, e, bleu_score, weight in zip(tgt_samples, e_samples, bleu_scores, tgt_sample_weights):
-                            print('Sample: %s ||| e: %d ||| bleu: %f ||| weight: %f' % (' '.join(tgt_sample), e, bleu_score, weight))
-                        print()
+                        if args.debug:
+                            print('*' * 30)
+                            print('Target: %s' % ' '.join(tgt_sent))
+                            for tgt_sample, e, bleu_score, weight in zip(tgt_samples, e_samples, bleu_scores, tgt_sample_weights):
+                                print('Sample: %s ||| e: %d ||| bleu: %f ||| weight: %f' % (' '.join(tgt_sample), e, bleu_score, weight))
+                            print()
 
                         raml_src_images.extend([src_image] * len(tgt_samples))
                         raml_tgt_sents.extend(tgt_samples)

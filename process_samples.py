@@ -5,6 +5,8 @@ import sys
 import re
 import argparse
 import torch
+
+from dataset import Dataset
 from util import read_corpus
 import numpy as np
 from scipy.misc import comb
@@ -91,6 +93,73 @@ def get_new_ngram(ngram, n, vocab):
     new_ngram = [vocab.id2word[wid] for wid in new_ngram_wids]
 
     return new_ngram
+
+
+def sample_image_captioning_ngram(args):
+    dataset = Dataset(args.data_folder)
+    f_out = open(args.output, 'w')
+
+    tgt_vocab = torch.load(args.vocab)
+
+    smooth_bleu = args.smooth_bleu
+    sm_func = None
+    if smooth_bleu:
+        sm_func = SmoothingFunction().method3
+
+    for fid, img_encoding, captions in dataset.train_examples():
+        for tgt_sent in captions:
+            # source sentence is actually the original target sentence!
+            src_sent = ' '.join(tgt_sent)
+            tgt_sent = tgt_sent[1:-1]  # remove <s> and </s>
+
+            tgt_len = len(tgt_sent)
+            tgt_samples = []
+            tgt_samples_distort_rates = []    # how many unigrams are replaced
+
+            # generate 100 samples
+
+            # append itself
+            tgt_samples.append(tgt_sent)
+            tgt_samples_distort_rates.append(0)
+
+            for sid in xrange(args.sample_size - 1):
+                n = np.random.randint(1, min(tgt_len, args.max_ngram_size + 1)) # we do not replace the last token: it must be a period!
+
+                idx = np.random.randint(tgt_len - n)
+                ngram = tgt_sent[idx: idx+n]
+                new_ngram = get_new_ngram(ngram, n, tgt_vocab)
+
+                sampled_tgt_sent = list(tgt_sent)
+                sampled_tgt_sent[idx: idx+n] = new_ngram
+
+                # compute the probability of this sample
+                # prob = 1. / args.max_ngram_size * 1. / (tgt_len - 1 + n) * 1 / (len(tgt_vocab) ** n)
+
+                tgt_samples.append(sampled_tgt_sent)
+                tgt_samples_distort_rates.append(n)
+
+            # compute bleu scores or edit distances and rank the samples by bleu scores
+            rewards = []
+            for tgt_sample, tgt_sample_distort_rate in zip(tgt_samples, tgt_samples_distort_rates):
+                if args.reward == 'bleu':
+                    reward = sentence_bleu([tgt_sent], tgt_sample, smoothing_function=sm_func)
+                else:
+                    reward = -tgt_sample_distort_rate
+
+                rewards.append(reward)
+
+            tgt_ranks = sorted(range(len(tgt_samples)), key=lambda i: rewards[i], reverse=True)
+            # convert list of tokens into a string
+            tgt_samples = [' '.join(tgt_sample) for tgt_sample in tgt_samples]
+
+            print('*' * 50, file=f_out)
+            print('source: ' + src_sent, file=f_out)
+            print('%d samples' % len(tgt_samples), file=f_out)
+            for i in tgt_ranks:
+                print('%s ||| %f' % (tgt_samples[i], rewards[i]), file=f_out)
+            print('*' * 50, file=f_out)
+
+    f_out.close()
 
 
 def sample_ngram(args):
@@ -262,30 +331,31 @@ def sample_from_hamming_distance_payoff_distribution(args):
             tgt_samples.append(new_tgt_sent)
 
 
-def generate_hamming_distance_payoff_distribution(max_sent_len, vocab_size, tau=1.):
+def generate_hamming_distance_payoff_distribution(max_sent_len, vocab_size, tau=1., scale=1.):
     """compute the q distribution for Hamming Distance (substitution only) as in the RAML paper"""
-    probs = dict()
+    normalized_counts = dict()
     Z_qs = dict()
     for sent_len in xrange(1, max_sent_len + 1):
         counts = [1.]  # e = 0, count = 1
         for e in xrange(1, sent_len + 1):
             # apply the rescaling trick as in https://gist.github.com/norouzi/8c4d244922fa052fa8ec18d8af52d366
-            count = comb(sent_len, e) * math.exp(-e / tau) * ((vocab_size - 1) ** (e - e / tau))
+            count = comb(sent_len, e) * math.exp(-e / tau) * ((vocab_size - 1) ** (e - scale * e / tau))
             counts.append(count)
 
         Z_qs[sent_len] = Z_q = sum(counts)
-        prob = [count / Z_q for count in counts]
-        probs[sent_len] = prob
+        normalized_count = [count / Z_q for count in counts]
+        normalized_counts[sent_len] = normalized_count
 
         # print('sent_len=%d, %s' % (sent_len, prob))
 
-    return probs, Z_qs
+    return normalized_counts, Z_qs
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=['sample_from_model', 'sample_ngram_adapt', 'sample_ngram'], required=True)
     parser.add_argument('--vocab', type=str)
+    parser.add_argument('--data_folder', type=str, help='path to the data folder')
     parser.add_argument('--src', type=str)
     parser.add_argument('--tgt', type=str)
     parser.add_argument('--parallel_data', type=str)
@@ -300,7 +370,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     if args.mode == 'sample_ngram':
-        sample_ngram(args)
+        sample_image_captioning_ngram(args)
     elif args.mode == 'sample_from_model':
         sample_from_model(args)
     elif args.mode == 'sample_ngram_adapt':
