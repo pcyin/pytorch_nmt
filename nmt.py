@@ -483,6 +483,48 @@ def read_raml_train_data(data_file, temp):
     return train_data
 
 
+def read_sqdml_train_data(data_file, temp):
+    train_data = dict()
+    num_pattern = re.compile('^(\d+) samples$')
+    with open(data_file) as f:
+        while True:
+            line = f.readline()
+            if line is None or line == '':
+                break
+
+            assert line.startswith('***')
+
+            img_file = f.readline()[len('image_file: '):].strip()
+            tgt_num = int(num_pattern.match(f.readline().strip()).group(1))
+            tgt_samples = []
+            tgt_samples_orig = []
+            tgt_samples_is_original = []
+            tgt_scores = []
+            for i in xrange(tgt_num):
+                d = f.readline().strip().split(' ||| ')
+                assert len(d) == 4
+
+                tgt_sent = d[0].strip()
+                tgt_origin = int(d[1])
+                tgt_is_original = True if int(d[2]) == 1 else False
+                tgt_samples_is_original.append(tgt_is_original)
+                bleu_scores = [float(s) for s in d[3].split(', ')]
+                tgt_samples.append(tgt_sent)
+                expected_score = 1.0 / len(bleu_scores) * sum(bleu_score / temp for bleu_score in bleu_scores)
+                tgt_scores.append(expected_score)
+                tgt_samples_orig.append(tgt_origin)
+
+            tgt_scores = np.exp(tgt_scores)
+            tgt_scores = tgt_scores / np.sum(tgt_scores)
+
+            tgt_entry = zip(tgt_samples, tgt_samples_orig, tgt_samples_is_original, tgt_scores)
+            train_data[img_file] = tgt_entry
+
+            line = f.readline()
+
+    return train_data
+
+
 def train_sqdml(args):
     tau = args.temp
 
@@ -495,8 +537,8 @@ def train_sqdml(args):
         # dict of (src, [tgt: (sent, prob)])
         print('read in raml training data...', file=sys.stderr, end='')
         begin_time = time.time()
-        raml_samples = read_raml_train_data(args.raml_sample_file, temp=tau)
-        print('done[%d s].' % (time.time() - begin_time))
+        sqdml_samples = read_sqdml_train_data(args.raml_sample_file, temp=tau)
+        print('done[%d s].' % (time.time() - begin_time), file=sys.stderr)
     elif args.raml_sample_mode.startswith('hamming_distance'):
         print('sample from hamming distance payoff distribution', file=sys.stderr)
         payoff_prob, Z_qs = generate_hamming_distance_payoff_distribution(max_sent_len=args.decode_max_time_step,
@@ -525,7 +567,26 @@ def train_sqdml(args):
             raml_tgt_weights = []
 
             if args.raml_sample_mode == 'pre_sample':
-                raise NotImplementedError()
+                for image_id, src_image, tgt_sents in batch_examples:
+                    tgt_samples_all = sqdml_samples[image_id]
+                    if args.sample_size >= len(tgt_samples_all):
+                        tgt_samples = tgt_samples_all
+                    else:
+                        tgt_samples = []
+                        # make sure the ground truth y* is in the samples
+                        ground_truth_samples = [sample for sample in tgt_samples_all if sample[2]]
+                        tgt_samples.extend(ground_truth_samples[:args.sample_size])
+
+                        distorted_sample_ids = [i for i in range(len(tgt_samples_all)) if tgt_samples_all[i][2] is False]
+                        if len(tgt_samples) < args.sample_size:
+                            tgt_samples_id = np.random.choice(distorted_sample_ids,
+                                                              size=args.sample_size - len(tgt_samples),
+                                                              replace=False)
+                            tgt_samples.extend([tgt_samples_all[i] for i in tgt_samples_id])
+
+                    raml_src_images.append(src_image)
+                    raml_tgt_sents.extend([['<s>'] + sent.split(' ') + ['</s>'] for sent, origin, is_original, weight in tgt_samples])
+                    raml_tgt_weights.extend([weight for sent, origin, is_original, weight in tgt_samples])
             elif args.raml_sample_mode in ['hamming_distance', 'hamming_distance_impt_sample']:
                 for image_id, src_image, tgt_sents in batch_examples:
                     tgt_samples = []  # make sure the ground truth y* is in the samples
@@ -743,7 +804,7 @@ def train_raml(args):
         print('read in raml training data...', file=sys.stderr, end='')
         begin_time = time.time()
         raml_samples = read_raml_train_data(args.raml_sample_file, temp=tau)
-        print('done[%d s].' % (time.time() - begin_time))
+        print('done[%d s].' % (time.time() - begin_time), file=sys.stderr)
     elif args.raml_sample_mode.startswith('hamming_distance'):
         print('sample from hamming distance payoff distribution', file=sys.stderr)
         payoff_prob, Z_qs = generate_hamming_distance_payoff_distribution(max_sent_len=args.decode_max_time_step,

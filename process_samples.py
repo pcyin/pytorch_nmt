@@ -95,6 +95,69 @@ def get_new_ngram(ngram, n, vocab):
     return new_ngram
 
 
+def sample_imgage_captioning_sqdml_ngram(args):
+    dataset = Dataset(args.data_folder)
+    f_out = open(args.output, 'w')
+    assert args.reward == 'bleu'
+
+    tgt_vocab = torch.load(args.vocab)
+
+    smooth_bleu = args.smooth_bleu
+    sm_func = None
+    if smooth_bleu:
+        sm_func = SmoothingFunction().method3
+
+    for fid, img_encoding, captions in dataset.train_examples():
+        tgt_samples = []
+
+        captions = [sent[1:-1] for sent in captions]  # remove <s> and </s>
+
+        # append ground-truth sentences
+        for i, tgt_sent in enumerate(captions):
+            tgt_samples.append((tgt_sent, i))
+
+        sample_size = args.sample_size - len(tgt_samples)
+        tgt_sent_ids = np.random.randint(0, len(captions), size=sample_size)
+        tgt_sent_lens = [len(sent) for sent in captions]
+        for sid in xrange(sample_size):
+            tgt_sent_id = tgt_sent_ids[sid]
+            tgt_sent = captions[tgt_sent_id]
+            tgt_len = tgt_sent_lens[tgt_sent_id]
+            n = np.random.randint(1, min(tgt_len, args.max_ngram_size + 1))
+
+            idx = np.random.randint(tgt_len - n + 1)
+            ngram = tgt_sent[idx: idx + n]
+            new_ngram = get_new_ngram(ngram, n, tgt_vocab)
+
+            sampled_tgt_sent = list(tgt_sent)
+            sampled_tgt_sent[idx: idx + n] = new_ngram
+
+            tgt_samples.append((sampled_tgt_sent, tgt_sent_id))
+
+        # compute bleu scores or edit distances and rank the samples by bleu scores
+        rewards = []
+        for tgt_sample, orig_tgt_id in tgt_samples:
+            reward_arr = [sentence_bleu([tgt_sent], tgt_sample, smoothing_function=sm_func)
+                          for tgt_sent in captions]
+
+            rewards.append(reward_arr)
+
+        tgt_ranks = sorted(range(len(tgt_samples)), key=lambda i: sum(rewards[i]), reverse=True)
+        # convert list of tokens into a string
+        tgt_samples = [(' '.join(tgt_sample), orig_tgt_id) for tgt_sample, orig_tgt_id in tgt_samples]
+
+        print('*' * 50, file=f_out)
+        print('image_file: ' + fid, file=f_out)
+        print('%d samples' % len(tgt_samples), file=f_out)
+        for i in tgt_ranks:
+            print('%s ||| %d ||| %d ||| %s' % (tgt_samples[i][0],
+                                               tgt_samples[i][1],
+                                               1 if any(r == 1. for r in rewards[i]) else 0,
+                                               ', '.join('%f' % r for r in rewards[i])),
+                  file=f_out)
+        print('*' * 50, file=f_out)
+
+
 def sample_image_captioning_ngram(args):
     dataset = Dataset(args.data_folder)
     f_out = open(args.output, 'w')
@@ -123,9 +186,9 @@ def sample_image_captioning_ngram(args):
             tgt_samples_distort_rates.append(0)
 
             for sid in xrange(args.sample_size - 1):
-                n = np.random.randint(1, min(tgt_len, args.max_ngram_size + 1)) # we do not replace the last token: it must be a period!
+                n = np.random.randint(1, min(tgt_len, args.max_ngram_size + 1))
 
-                idx = np.random.randint(tgt_len - n)
+                idx = np.random.randint(tgt_len - n + 1)
                 ngram = tgt_sent[idx: idx+n]
                 new_ngram = get_new_ngram(ngram, n, tgt_vocab)
 
@@ -353,7 +416,7 @@ def generate_hamming_distance_payoff_distribution(max_sent_len, vocab_size, tau=
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', choices=['sample_from_model', 'sample_ngram_adapt', 'sample_ngram'], required=True)
+    parser.add_argument('--mode', choices=['sample_from_model', 'sample_ngram_adapt', 'sample_ngram', 'sample_ngram_sqdml'], required=True)
     parser.add_argument('--vocab', type=str)
     parser.add_argument('--data_folder', type=str, help='path to the data folder')
     parser.add_argument('--src', type=str)
@@ -371,6 +434,8 @@ if __name__ == '__main__':
 
     if args.mode == 'sample_ngram':
         sample_image_captioning_ngram(args)
+    if args.mode == 'sample_ngram_sqdml':
+        sample_imgage_captioning_sqdml_ngram(args)
     elif args.mode == 'sample_from_model':
         sample_from_model(args)
     elif args.mode == 'sample_ngram_adapt':
