@@ -1,4 +1,6 @@
 from __future__ import print_function
+from multiprocessing import Pool
+import signal
 from nltk.translate.bleu_score import sentence_bleu
 from nltk.translate.bleu_score import SmoothingFunction
 import sys
@@ -95,6 +97,14 @@ def get_new_ngram(ngram, n, vocab):
     return new_ngram
 
 
+def __bleu_scores(datum):
+    hyp, refs = datum
+    reward_arr = [sentence_bleu([tgt_sent], hyp, smoothing_function=SmoothingFunction().method3)  # SmoothingFunction().method3
+                       for tgt_sent in refs]
+
+    return reward_arr
+
+
 def sample_imgage_captioning_sqdml_ngram(args):
     dataset = Dataset(args.data_folder)
     f_out = open(args.output, 'w')
@@ -107,6 +117,7 @@ def sample_imgage_captioning_sqdml_ngram(args):
     if smooth_bleu:
         sm_func = SmoothingFunction().method3
 
+    pool = Pool(5, lambda: signal.signal(signal.SIGINT, signal.SIG_IGN))
     for fid, img_encoding, captions in dataset.train_examples():
         tgt_samples = []
 
@@ -136,11 +147,13 @@ def sample_imgage_captioning_sqdml_ngram(args):
 
         # compute bleu scores or edit distances and rank the samples by bleu scores
         rewards = []
-        for tgt_sample, orig_tgt_id in tgt_samples:
-            reward_arr = [sentence_bleu([tgt_sent], tgt_sample, smoothing_function=sm_func)
-                          for tgt_sent in captions]
-
-            rewards.append(reward_arr)
+        rewards = pool.map(__bleu_scores, [(tgt_sample, captions) for tgt_sample in map(lambda x: x[0], tgt_samples)])
+        # for tgt_sample, orig_tgt_id in tgt_samples:
+        #     reward_arr = [sentence_bleu([tgt_sent], tgt_sample, smoothing_function=sm_func)
+        #                   for tgt_sent in captions]
+        #
+        #     rewards.append(reward_arr)
+        # rewards = parallel(delayed(__bleu_scores)(tgt_sample, captions) for tgt_sample in all_samples)
 
         tgt_ranks = sorted(range(len(tgt_samples)), key=lambda i: sum(rewards[i]), reverse=True)
         # convert list of tokens into a string
@@ -415,6 +428,7 @@ def generate_hamming_distance_payoff_distribution(max_sent_len, vocab_size, tau=
 
 
 if __name__ == '__main__':
+    np.random.seed(1234)
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=['sample_from_model', 'sample_ngram_adapt', 'sample_ngram', 'sample_ngram_sqdml'], required=True)
     parser.add_argument('--vocab', type=str)
