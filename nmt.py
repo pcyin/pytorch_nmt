@@ -510,7 +510,7 @@ def read_sqdml_train_data(data_file, temp):
                 tgt_samples_is_original.append(tgt_is_original)
                 bleu_scores = [float(s) for s in d[3].split(', ')]
                 tgt_samples.append(tgt_sent)
-                expected_score = 1.0 / len(bleu_scores) * sum(bleu_score / temp for bleu_score in bleu_scores)
+                expected_score = sum(bleu_score / temp for bleu_score in bleu_scores) / float(len(bleu_scores))
                 tgt_scores.append(expected_score)
                 tgt_samples_orig.append(tgt_origin)
 
@@ -1187,8 +1187,16 @@ def test(args):
     if args.save_to_file:
         print('save decoding results to %s' % args.save_to_file, file=sys.stderr)
         with open(args.save_to_file, 'w') as f:
-            for hyps in hypotheses:
-                f.write(' '.join(hyps[0][1:-1]) + '\n')
+            for hyps, (file_id, _, refs) in zip(hypotheses, dataset.test_examples()):
+                f.write('*' * 50 + '\n')
+                f.write('File: %s\n' % file_id)
+                for i, ref in enumerate(refs):
+                    f.write('Target %d: %s\n' % (i, ' '.join(ref[1:-1])))
+                f.write('-' * 10 + '\n')
+                f.write('Prediction: %s\n' % ' '.join(hyps[0][1:-1]))
+
+                avg_bleu = get_metric_score([refs], [hyps[0]], 'avg_sent_bleu')
+                f.write('Avg Reward: %f\n' % avg_bleu)
 
 
 def interactive(args):
