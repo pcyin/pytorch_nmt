@@ -450,6 +450,7 @@ def train(args):
 def read_raml_train_data(data_file, temp):
     train_data = dict()
     num_pattern = re.compile('^(\d+) samples$')
+
     with open(data_file) as f:
         while True:
             line = f.readline()
@@ -458,29 +459,64 @@ def read_raml_train_data(data_file, temp):
 
             assert line.startswith('***')
 
-            src_sent = f.readline()[len('source: '):].strip()
+            img_file = f.readline()[len('image_file: '):].strip()
             tgt_num = int(num_pattern.match(f.readline().strip()).group(1))
-            tgt_samples = []
-            tgt_scores = []
+            tgt_samples = defaultdict(list)
             for i in xrange(tgt_num):
                 d = f.readline().strip().split(' ||| ')
-                if len(d) < 2:
-                    continue
+                assert len(d) == 4
 
                 tgt_sent = d[0].strip()
-                bleu_score = float(d[1])
-                tgt_samples.append(tgt_sent)
-                tgt_scores.append(bleu_score / temp)
+                tgt_origin = int(d[1])
+                tgt_is_original = True if int(d[2]) == 1 else False
+                bleu_score = [float(s) for s in d[3].split(', ')][tgt_origin]
 
-            tgt_scores = np.exp(tgt_scores)
-            tgt_scores = tgt_scores / np.sum(tgt_scores)
+                tgt_samples[tgt_origin].append((tgt_sent, tgt_is_original, bleu_score))
 
-            tgt_entry = zip(tgt_samples, tgt_scores)
-            train_data[src_sent] = tgt_entry
+            for ref_id in tgt_samples.keys():
+                tgt_scores = [x[2] / temp for x in tgt_samples[ref_id]]
+                tgt_scores = np.exp(tgt_scores)
+                tgt_scores = tgt_scores / np.sum(tgt_scores)
+
+                tgt_samples[ref_id] = [(x[0], x[1], score) for x, score in zip(tgt_samples[ref_id], tgt_scores)]
+
+            train_data[img_file] = tgt_samples
 
             line = f.readline()
 
     return train_data
+
+    # with open(data_file) as f:
+    #     while True:
+    #         line = f.readline()
+    #         if line is None or line == '':
+    #             break
+    #
+    #         assert line.startswith('***')
+    #
+    #         src_sent = f.readline()[len('source: '):].strip()
+    #         tgt_num = int(num_pattern.match(f.readline().strip()).group(1))
+    #         tgt_samples = []
+    #         tgt_scores = []
+    #         for i in xrange(tgt_num):
+    #             d = f.readline().strip().split(' ||| ')
+    #             if len(d) < 2:
+    #                 continue
+    #
+    #             tgt_sent = d[0].strip()
+    #             bleu_score = float(d[1])
+    #             tgt_samples.append(tgt_sent)
+    #             tgt_scores.append(bleu_score / temp)
+    #
+    #         tgt_scores = np.exp(tgt_scores)
+    #         tgt_scores = tgt_scores / np.sum(tgt_scores)
+    #
+    #         tgt_entry = zip(tgt_samples, tgt_scores)
+    #         train_data[src_sent] = tgt_entry
+    #
+    #         line = f.readline()
+    #
+    # return train_data
 
 
 def read_sqdml_train_data(data_file, temp):
@@ -840,18 +876,26 @@ def train_raml(args):
 
             if args.raml_sample_mode == 'pre_sample':
                 for image_id, src_image, tgt_sents in batch_examples:
-                    for tgt_sent in tgt_sents:
-                        tgt_samples_all = raml_samples[' '.join(tgt_sent)]
+                    tgt_samples_entry = raml_samples[image_id]
 
+                    for tgt_sent_id in tgt_samples_entry.keys():
+                        tgt_samples_all = tgt_samples_entry[tgt_sent_id]
                         if args.sample_size >= len(tgt_samples_all):
                             tgt_samples = tgt_samples_all
                         else:
-                            tgt_samples_id = np.random.choice(range(1, len(tgt_samples_all)), size=args.sample_size - 1, replace=False)
-                            tgt_samples = [tgt_samples_all[0]] + [tgt_samples_all[i] for i in tgt_samples_id] # make sure the ground truth y* is in the samples
+                            ground_truth_id = [i for i, sample in enumerate(tgt_samples_all) if sample[1] is True]
+                            # assert len(ground_truth_id) == 1
+                            if len(ground_truth_id) > 1:
+                                print('\tweird: %s' % image_id, file=sys.stderr)
+                            ground_truth_id = ground_truth_id[0]
+                            tgt_samples_id = np.random.choice([x for x in xrange(len(tgt_samples_all)) if x != ground_truth_id],
+                                                              size=args.sample_size - 1,
+                                                              replace=False)
+                            tgt_samples = [tgt_samples_all[ground_truth_id]] + [tgt_samples_all[i] for i in tgt_samples_id] # make sure the ground truth y* is in the samples
 
                         raml_src_images.extend([src_image] * len(tgt_samples))
-                        raml_tgt_sents.extend([['<s>'] + sent.split(' ') + ['</s>'] for sent, weight in tgt_samples])
-                        raml_tgt_weights.extend([weight for sent, weight in tgt_samples])
+                        raml_tgt_sents.extend([['<s>'] + sent.split(' ') + ['</s>'] for sent, is_original, weight in tgt_samples])
+                        raml_tgt_weights.extend([weight for sent, is_original, weight in tgt_samples])
             elif args.raml_sample_mode in ['hamming_distance', 'hamming_distance_impt_sample']:
                 for image_id, src_image, tgt_sents in batch_examples:
                     # sample args.sample_size sentences from each target
