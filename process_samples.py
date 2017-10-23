@@ -90,9 +90,10 @@ def get_new_ngram(ngram, n, vocab):
     """
     replace ngram `ngram` with a newly sampled ngram of the same length
     """
-
-    new_ngram_wids = [np.random.randint(3, len(vocab)) for i in xrange(n)]
-    new_ngram = [vocab.id2word[wid] for wid in new_ngram_wids]
+    new_ngram = ngram
+    while ngram == new_ngram:
+        new_ngram_wids = [np.random.randint(3, len(vocab)) for i in xrange(n)]
+        new_ngram = [vocab.id2word[wid] for wid in new_ngram_wids]
 
     return new_ngram
 
